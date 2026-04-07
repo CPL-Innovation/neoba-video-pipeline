@@ -7,6 +7,7 @@ import { THREADS } from '../../lib/constants'
 
 export function ProposedThreads() {
   const [threads, setThreads] = useState<ProposedThread[]>([])
+  const [activeThreads, setActiveThreads] = useState<string[]>([...THREADS])
   const [loading, setLoading] = useState(true)
   const [expandedThreads, setExpandedThreads] = useState<Set<string>>(new Set())
   const [mergeMode, setMergeMode] = useState(false)
@@ -15,11 +16,13 @@ export function ProposedThreads() {
   const [remapOpen, setRemapOpen] = useState<string | null>(null)
 
   useEffect(() => {
-    fetch('/api/run/latest/proposed-threads')
-      .then((r) => r.json())
-      .then(setThreads)
-      .catch(() => setThreads([]))
-      .finally(() => setLoading(false))
+    Promise.all([
+      fetch('/api/run/latest/proposed-threads').then(r => r.json()).catch(() => []),
+      fetch('/api/run/latest/threads').then(r => r.json()).catch(() => [...THREADS]),
+    ]).then(([proposedData, threadList]) => {
+      setThreads(proposedData)
+      setActiveThreads(threadList)
+    }).finally(() => setLoading(false))
   }, [])
 
   const handleAction = async (name: string, action: 'accept' | 'reject' | 'merge', mergeInto?: string) => {
@@ -248,7 +251,7 @@ export function ProposedThreads() {
                       {remapOpen === t.name && (
                         <div className="absolute top-full right-0 mt-1 bg-bg2 border border-white/10 rounded-lg shadow-lg z-20 py-1 w-56">
                           <p className="px-3 py-1.5 text-xs text-text-dim">Remap to:</p>
-                          {THREADS.map((thread) => (
+                          {activeThreads.map((thread) => (
                             <button
                               key={thread}
                               className="w-full text-left px-3 py-1.5 text-xs text-text-primary hover:bg-white/5 transition-colors"

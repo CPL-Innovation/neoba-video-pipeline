@@ -4,9 +4,12 @@ import { Card } from '../../components/Card'
 import { Button } from '../../components/Button'
 import type { ClassifiedItem } from '../../lib/types'
 
+type Filter = 'all' | 'unique' | 'single-word' | 'multi-word'
+
 export function CrypticQueue() {
   const [items, setItems] = useState<(ClassifiedItem & { description?: string; date?: string })[]>([])
   const [loading, setLoading] = useState(true)
+  const [filter, setFilter] = useState<Filter>('unique')
 
   useEffect(() => {
     fetch('/api/run/latest/cryptic')
@@ -16,8 +19,27 @@ export function CrypticQueue() {
       .finally(() => setLoading(false))
   }, [])
 
-  const decoded = items.filter((i) => i.decode_note)
-  const undecoded = items.filter((i) => !i.decode_note)
+  // Apply filters
+  const filteredItems = (() => {
+    let result = items
+    if (filter === 'unique') {
+      const seen = new Set<string>()
+      result = result.filter((i) => {
+        const key = (i.description || '').toLowerCase().trim()
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+    } else if (filter === 'single-word') {
+      result = result.filter((i) => !(i.description || '').trim().includes(' '))
+    } else if (filter === 'multi-word') {
+      result = result.filter((i) => (i.description || '').trim().includes(' '))
+    }
+    return result
+  })()
+
+  const decoded = filteredItems.filter((i) => i.decode_note)
+  const undecoded = filteredItems.filter((i) => !i.decode_note)
 
   const exportCSV = () => {
     const rows = [
@@ -47,6 +69,26 @@ export function CrypticQueue() {
           ) : undefined
         }
       />
+
+      {!loading && items.length > 0 && (
+        <div className="flex items-center gap-2 mb-4">
+          <span className="text-xs text-text-dim">Filter:</span>
+          {([['all', 'All'], ['unique', 'Hide Duplicates'], ['single-word', 'Single-word Only'], ['multi-word', 'Multi-word Only']] as const).map(([value, label]) => (
+            <button
+              key={value}
+              onClick={() => setFilter(value)}
+              className={`text-xs px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                filter === value ? 'bg-white/10 text-text-primary' : 'text-text-dim hover:text-text-muted hover:bg-white/4'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+          <span className="text-xs text-text-dim ml-auto">
+            {filteredItems.length} of {items.length} items
+          </span>
+        </div>
+      )}
 
       {loading ? (
         <p className="text-sm text-text-dim">Loading...</p>

@@ -278,10 +278,19 @@ async def start_clustering(run_id: str):
     if not run_id:
         raise HTTPException(404, "No runs found")
 
+    cluster_key = f"{run_id}:cluster"
+    if cluster_key in running_jobs and running_jobs[cluster_key].get("status") == "running":
+        raise HTTPException(409, "Clustering already running for this run")
+
+    running_jobs[cluster_key] = {"status": "running"}
+
     def run_in_background():
         try:
             run_clustering(run_id)
+            running_jobs[cluster_key]["status"] = "completed"
         except Exception as e:
+            running_jobs[cluster_key]["status"] = "failed"
+            running_jobs[cluster_key]["error"] = str(e)
             print(f"Clustering error: {e}")
 
     thread = threading.Thread(target=run_in_background, daemon=True)
@@ -327,6 +336,21 @@ async def get_clusters(run_id: str):
         raise HTTPException(404, "Cluster data not found. Run clustering first.")
     with open(cluster_file) as f:
         return json.load(f)
+
+
+@app.get("/api/run/{run_id}/cluster/status")
+async def get_cluster_status(run_id: str):
+    if run_id == "latest":
+        run_id = get_latest_run() or ""
+    if not run_id:
+        raise HTTPException(404, "No runs found")
+    cluster_key = f"{run_id}:cluster"
+    if cluster_key in running_jobs:
+        return running_jobs[cluster_key]
+    run_dir = get_run_dir(run_id)
+    if (run_dir / "clusters.json").exists():
+        return {"status": "completed"}
+    return {"status": "idle"}
 
 
 # --- Proposed Threads ---

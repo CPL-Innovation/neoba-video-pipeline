@@ -12,18 +12,18 @@ LLM-powered classification and entity extraction tool for the NEOBA (Northeast O
 
 | View | Description |
 |------|-------------|
-| Run Classification | Execute Tier 1+2 (LLM) and Tier 3 (clustering) with progress tracking |
+| Run Classification | Execute Tier 1+2 (LLM) and Tier 3 (clustering) with real-time progress tracking and status polling |
 | Review Table | Browse, search, and filter classified items with inline detail panels |
 | Proposed Threads | Review LLM-suggested threads with accept, reject, merge, and remap actions |
 | Entity Browser | Explore extracted entities with merge support, suggested merges, and single-name resolution |
-| Cluster Explorer | Visualize semantic clusters (UMAP + HDBSCAN) |
-| Cryptic Queue | Items flagged as cryptic for manual review |
+| Cluster Explorer | Interactive scatter plot with zoom/pan, dot hover/click for item details, cluster selection with highlighting and detail panel |
+| Cryptic Queue | Items flagged as cryptic for manual review, with duplicate filtering |
 | Export | Export classifications in various formats |
 
 ### Pipeline (Tier 1+2+3)
 
 1. **Tier 1+2** (LLM): Claude classifies items into threads and extracts entities (people, places, organizations, event types) in batches
-2. **Tier 3** (Clustering): TF-IDF + UMAP + HDBSCAN for semantic grouping
+2. **Tier 3** (Clustering): TF-IDF + UMAP + HDBSCAN for semantic grouping with background job tracking and status polling
 
 ## Setup
 

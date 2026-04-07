@@ -129,8 +129,22 @@ export function RunClassification() {
   const startClustering = async () => {
     setStatus('clustering')
     try {
-      await fetch(`/api/run/${runName}/cluster`, { method: 'POST' })
-      setTimeout(() => setStatus('done'), 5000)
+      const res = await fetch(`/api/run/${runName}/cluster`, { method: 'POST' })
+      if (!res.ok) throw new Error('Failed to start clustering')
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`/api/run/${runName}/cluster/status`)
+          const data = await statusRes.json()
+          if (data.status === 'completed') {
+            clearInterval(poll)
+            setStatus('done')
+          } else if (data.status === 'failed') {
+            clearInterval(poll)
+            setStatus('done')
+            console.error('Clustering failed:', data.error)
+          }
+        } catch { /* keep polling */ }
+      }, 2000)
     } catch {
       setStatus('done')
     }
@@ -340,7 +354,18 @@ export function RunClassification() {
           )}
 
           {status === 'clustering' && (
-            <div className="text-sm text-text-muted">Running Tier 3 clustering (TF-IDF + UMAP + HDBSCAN)...</div>
+            <div className="space-y-3">
+              <div className="text-sm text-text-muted flex items-center gap-2">
+                <span className="inline-block w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full animate-spin" />
+                Running Tier 3 clustering (TF-IDF + UMAP + HDBSCAN)...
+              </div>
+              {progress.totalItems > 0 && (
+                <div className="text-xs text-text-muted border-t border-white/6 pt-2">
+                  Classification: {progress.classifiedItems.toLocaleString()} / {progress.totalItems.toLocaleString()} items classified
+                  {progress.unclassified > 0 && ` · ${progress.unclassified} unclassified`}
+                </div>
+              )}
+            </div>
           )}
         </Card>
       </div>

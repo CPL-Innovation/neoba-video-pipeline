@@ -33,6 +33,48 @@ def merge_edits(classifications: list[dict], edits: list[dict]) -> list[dict]:
     return merged
 
 
+def _build_entity_rename_map(edits: list[dict]) -> dict[str, str]:
+    """Build a map of source entity names (lowercase) -> target canonical name from merge edits.
+
+    Handles transitive chains by processing in order.
+    """
+    rename: dict[str, str] = {}
+    for edit in edits:
+        if edit.get("type") != "entity_merge":
+            continue
+        target = edit.get("target_entity", "")
+        for src in edit.get("source_entities", []):
+            rename[src.lower().strip()] = target
+    # Resolve transitive chains: if A->B and B->C, A should map to C
+    changed = True
+    while changed:
+        changed = False
+        for src, tgt in list(rename.items()):
+            tgt_lower = tgt.lower().strip()
+            if tgt_lower in rename and rename[tgt_lower] != tgt:
+                rename[src] = rename[tgt_lower]
+                changed = True
+    return rename
+
+
+def _apply_entity_renames(entities_dict: dict, rename_map: dict[str, str]) -> dict:
+    """Apply entity renames to a per-item entities dict."""
+    result = {}
+    for key in ["people", "places", "organizations"]:
+        names = entities_dict.get(key, [])
+        renamed = []
+        seen = set()
+        for name in names:
+            canonical = rename_map.get(name.lower().strip(), name)
+            if canonical.lower() not in seen:
+                renamed.append(canonical)
+                seen.add(canonical.lower())
+        result[key] = renamed
+    # Preserve event_type
+    result["event_type"] = entities_dict.get("event_type")
+    return result
+
+
 def export_enriched_data(run_name: str) -> dict:
     """Generate all export files for the dashboard."""
     run_dir = DATA_DIR / "runs" / run_name
@@ -59,9 +101,12 @@ def export_enriched_data(run_name: str) -> dict:
         with open(edits_file) as f:
             edits = json.load(f)
 
-    # Merge
+    # Merge field-level edits
     merged = merge_edits(classifications, edits)
     cls_map = {c["item_id"]: c for c in merged}
+
+    # Build entity rename map from entity_merge edits
+    entity_rename_map = _build_entity_rename_map(edits)
 
     # Build items-enriched.json
     items_enriched = []
@@ -82,7 +127,8 @@ def export_enriched_data(run_name: str) -> dict:
             # Full thread array
             enriched["threads"] = cls["threads"]
             enriched["proposed_thread"] = cls.get("proposed_thread")
-            enriched["entities"] = cls.get("entities", {})
+            raw_entities = cls.get("entities", {})
+            enriched["entities"] = _apply_entity_renames(raw_entities, entity_rename_map) if entity_rename_map else raw_entities
             enriched["genre"] = cls.get("genre", "unknown")
             enriched["is_cryptic"] = cls.get("is_cryptic", False)
             enriched["decode_note"] = cls.get("decode_note")
@@ -112,13 +158,11 @@ def export_enriched_data(run_name: str) -> dict:
     with open(export_dir / "archive-data-enriched.json", "w") as f:
         json.dump(archive_data, f)
 
-    # Copy entity index
-    entity_file = run_dir / "entity_index.json"
-    if entity_file.exists():
-        with open(entity_file) as f:
-            entity_data = json.load(f)
-        with open(export_dir / "entity_index.json", "w") as f:
-            json.dump(entity_data, f)
+    # Rebuild entity index (applies merge overlay) and export
+    from pipeline.postprocess import build_entity_index
+    entity_data = build_entity_index(run_name)
+    with open(export_dir / "entity_index.json", "w") as f:
+        json.dump(entity_data, f)
 
     # Copy clusters
     cluster_file = run_dir / "clusters.json"

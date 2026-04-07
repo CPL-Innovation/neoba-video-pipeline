@@ -48,6 +48,10 @@ class EditRequest(BaseModel):
     action: str | None = None
     merge_into: str | None = None
     timestamp: str | None = None
+    # Entity merge fields
+    source_entities: list[str] | None = None
+    target_entity: str | None = None
+    entity_type: str | None = None
 
 
 # --- Helpers ---
@@ -459,7 +463,34 @@ async def save_edit(run_id: str, edit: EditRequest):
                 with open(cls_file, "w") as f:
                     json.dump(classifications, f, indent=2)
 
+    # For entity_merge: rebuild entity index to reflect the merge
+    if edit.type == "entity_merge" and edit.source_entities and edit.target_entity:
+        from pipeline.postprocess import build_entity_index
+        actual_run = run_id if run_id != "latest" else (get_latest_run() or "")
+        if actual_run:
+            build_entity_index(actual_run)
+
     return {"status": "saved", "total_edits": len(edits)}
+
+
+# --- Entity Merge Suggestions ---
+
+@app.get("/api/run/{run_id}/entity-merge-suggestions")
+async def get_entity_merge_suggestions(run_id: str):
+    from pipeline.postprocess import suggest_entity_merges
+    actual_run = run_id if run_id != "latest" else (get_latest_run() or "")
+    if not actual_run:
+        return []
+    return suggest_entity_merges(actual_run)
+
+
+@app.get("/api/run/{run_id}/entity-single-names")
+async def get_entity_single_names(run_id: str):
+    from pipeline.postprocess import get_single_name_entities
+    actual_run = run_id if run_id != "latest" else (get_latest_run() or "")
+    if not actual_run:
+        return []
+    return get_single_name_entities(actual_run)
 
 
 # --- Export ---

@@ -15,7 +15,7 @@ LLM-powered classification and entity extraction tool for the NEOBA (Northeast O
 | Run Classification | Execute Tier 1+2 (LLM) and Tier 3 (clustering) with progress tracking |
 | Review Table | Browse, search, and filter classified items with inline detail panels |
 | Proposed Threads | Review LLM-suggested threads with accept, reject, merge, and remap actions |
-| Entity Browser | Explore extracted people, places, and organizations |
+| Entity Browser | Explore extracted entities with merge support, suggested merges, and single-name resolution |
 | Cluster Explorer | Visualize semantic clusters (UMAP + HDBSCAN) |
 | Cryptic Queue | Items flagged as cryptic for manual review |
 | Export | Export classifications in various formats |
@@ -48,6 +48,16 @@ echo "ANTHROPIC_API_KEY=sk-..." > .env
 ```
 
 The Vite dev server proxies `/api` requests to the backend.
+
+### Entity Merging
+
+The LLM extracts entities per-item independently, so the same entity often appears with different surface forms (e.g., "RTA" vs "Regional Transit Authority"). The Entity Browser supports:
+
+- **Multi-merge**: Select 2+ entities, set a canonical name, and merge. All `item_ids` combine under the canonical entry.
+- **Suggested merges**: Auto-detected candidates via substring, abbreviation, prefix, and normalization matching. One-click accept or dismiss.
+- **Single-name resolution**: A queue of people entities with single names (e.g., "Nader") that can be resolved to full names (e.g., "Ralph Nader").
+
+Merges are stored as overlay edits in `data/runs/<run>/edits.json` and never modify the original LLM output (`classifications.json`). They are applied when rebuilding the entity index and during export.
 
 ## Data
 

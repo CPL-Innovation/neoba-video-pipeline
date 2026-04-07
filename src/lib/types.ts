@@ -93,3 +93,20 @@ export interface Edit {
   new_value: unknown
   timestamp: string
 }
+
+export interface EntityMergeSuggestion {
+  entities: string[]
+  counts: Record<string, number>
+  suggested_canonical: string
+  match_type: 'substring' | 'abbreviation' | 'prefix' | 'normalized' | 'mixed'
+  total_count: number
+  entity_type: 'people' | 'places' | 'organizations'
+}
+
+export interface SingleNameEntity {
+  name: string
+  count: number
+  type: string
+  item_ids: string[]
+  sample_descriptions: string[]
+}

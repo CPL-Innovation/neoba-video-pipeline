@@ -44,7 +44,7 @@ pip install -r pipeline/requirements.txt
 # Set your Anthropic API key
 echo "ANTHROPIC_API_KEY=sk-..." > .env
 
-python pipeline/server.py   # starts on http://localhost:8000
+.venv/bin/python3 -m uvicorn pipeline.server:app --host 0.0.0.0 --port 8000
 ```
 
 The Vite dev server proxies `/api` requests to the backend.

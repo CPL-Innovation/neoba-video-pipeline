@@ -77,7 +77,7 @@ def aggregate_proposed_threads(run_name: str) -> list[dict]:
         for v in variants:
             all_item_ids.extend(proposals[v])
 
-        samples = [desc_map.get(iid, "") for iid in all_item_ids[:5]]
+        samples = [desc_map.get(iid, "") for iid in all_item_ids]
         similar = [v for v in variants if v != primary]
 
         # Load edits to check status
@@ -91,7 +91,13 @@ def aggregate_proposed_threads(run_name: str) -> list[dict]:
         merged_into = None
         for edit in edits:
             if edit.get("type") == "proposed_thread" and edit.get("name") == primary:
-                status = edit.get("action", "pending")
+                action = edit.get("action", "pending")
+                # accept is no longer a terminal state — classifications are
+                # updated on merge/remap, so the canonical thread stays pending
+                # and can be further merged or remapped
+                if action == "accept":
+                    continue
+                status = action
                 merged_into = edit.get("merge_into")
 
         result.append({
@@ -102,6 +108,27 @@ def aggregate_proposed_threads(run_name: str) -> list[dict]:
             "status": status,
             "merged_into": merged_into,
         })
+
+    # Consolidate merged threads into their targets
+    merged = [r for r in result if r["status"] == "merge" and r["merged_into"]]
+    for m in merged:
+        target = next((r for r in result if r["name"] == m["merged_into"]), None)
+        if target:
+            target["count"] += m["count"]
+            target["sample_descriptions"] = target["sample_descriptions"] + m["sample_descriptions"]
+        else:
+            # Target is a new canonical name — create an entry for it
+            result.append({
+                "name": m["merged_into"],
+                "count": m["count"],
+                "sample_descriptions": list(m["sample_descriptions"]),
+                "similar_proposals": [m["name"]],
+                "status": "pending",
+                "merged_into": None,
+            })
+
+    # Remove merged and remapped threads from result
+    result = [r for r in result if r["status"] not in ("merge", "remap")]
 
     result.sort(key=lambda x: -x["count"])
     return result

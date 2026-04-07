@@ -13,7 +13,6 @@ import { useRef } from 'react'
 import { PageHeader } from '../../components/PageHeader'
 import { Card } from '../../components/Card'
 import { Badge } from '../../components/Badge'
-import { THREADS } from '../../lib/constants'
 import type { SourceItem, ClassifiedItem } from '../../lib/types'
 
 interface MergedItem extends SourceItem {
@@ -25,6 +24,7 @@ type ProcessedFilter = '' | 'processed' | 'unprocessed'
 
 export function ReviewTable() {
   const [items, setItems] = useState<MergedItem[]>([])
+  const [threads, setThreads] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [sorting, setSorting] = useState<SortingState>([])
   const [threadFilter, setThreadFilter] = useState<string>('')
@@ -32,6 +32,7 @@ export function ReviewTable() {
   const [processedFilter, setProcessedFilter] = useState<ProcessedFilter>('')
   const [genreFilter, setGenreFilter] = useState<string>('')
   const [crypticFilter, setCrypticFilter] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
   const [showBaseline, setShowBaseline] = useState(false)
   const [expandedRow, setExpandedRow] = useState<string | null>(null)
   const tableContainerRef = useRef<HTMLDivElement>(null)
@@ -55,6 +56,12 @@ export function ReviewTable() {
           return { ...s, item_id: id, classification: classMap.get(id) }
         })
         setItems(merged)
+
+        // Fetch dynamic thread list
+        try {
+          const threadsRes = await fetch('/api/run/latest/threads')
+          if (threadsRes.ok) setThreads(await threadsRes.json())
+        } catch { /* use empty list */ }
       } catch {
         try {
           const res = await fetch('/data/source/items.json')
@@ -117,8 +124,16 @@ export function ReviewTable() {
       result = result.filter((item) => item.classification?.is_cryptic)
     }
 
+    // Search by description
+    if (searchQuery.trim()) {
+      const query = searchQuery.trim().toLowerCase()
+      result = result.filter((item) =>
+        item.description?.toLowerCase().includes(query)
+      )
+    }
+
     return result
-  }, [items, processedFilter, threadFilter, confidenceFilter, genreFilter, crypticFilter])
+  }, [items, processedFilter, threadFilter, confidenceFilter, genreFilter, crypticFilter, searchQuery])
 
   const columns = useMemo<ColumnDef<MergedItem>[]>(
     () => [
@@ -295,6 +310,18 @@ export function ReviewTable() {
         </h3>
 
         <div className="space-y-4">
+          {/* Search by description */}
+          <div>
+            <label className="block text-xs text-text-dim mb-1">Search</label>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search descriptions..."
+              className="w-full bg-bg3 border border-white/10 rounded-md px-2 py-1.5 text-xs text-text-primary placeholder:text-text-dim/50"
+            />
+          </div>
+
           {/* Processed status filter */}
           <div>
             <label className="block text-xs text-text-dim mb-1">Status</label>
@@ -317,7 +344,7 @@ export function ReviewTable() {
               className="w-full bg-bg3 border border-white/10 rounded-md px-2 py-1.5 text-xs text-text-primary"
             >
               <option value="">All threads</option>
-              {THREADS.map((t) => (
+              {threads.map((t) => (
                 <option key={t} value={t}>
                   {t}
                 </option>

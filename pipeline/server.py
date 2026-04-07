@@ -327,6 +327,29 @@ async def get_clusters(run_id: str):
 
 # --- Proposed Threads ---
 
+@app.get("/api/run/{run_id}/threads")
+async def get_threads(run_id: str):
+    """Return all active thread names: the 11 defined + any accepted proposed threads."""
+    DEFINED_THREADS = [
+        'Crime & Safety', 'Sports', 'Weather', 'Politics & Government',
+        'Economy & Labor', 'Schools & Education', 'Health & Medicine',
+        'Culture & Arts', 'Community & Neighborhoods',
+        'Daily Life & Human Interest', 'Media & Broadcasting',
+    ]
+    run_dir = get_run_dir(run_id)
+    cls_file = run_dir / "classifications.json"
+    extra = set()
+    if cls_file.exists():
+        with open(cls_file) as f:
+            classifications = json.load(f)
+        for cls in classifications:
+            for t in cls.get("threads", []):
+                name = t.get("name", "")
+                if name and name not in DEFINED_THREADS:
+                    extra.add(name)
+    return DEFINED_THREADS + sorted(extra)
+
+
 @app.get("/api/run/{run_id}/proposed-threads")
 async def get_proposed_threads(run_id: str):
     from pipeline.postprocess import aggregate_proposed_threads
@@ -365,6 +388,76 @@ async def save_edit(run_id: str, edit: EditRequest):
 
     with open(edits_file, "w") as f:
         json.dump(edits, f, indent=2)
+
+    # For merge/remap actions, update classifications
+    DEFINED_THREADS = [
+        'Crime & Safety', 'Sports', 'Weather', 'Politics & Government',
+        'Economy & Labor', 'Schools & Education', 'Health & Medicine',
+        'Culture & Arts', 'Community & Neighborhoods',
+        'Daily Life & Human Interest', 'Media & Broadcasting',
+    ]
+    # For accept: clear proposed_thread and add the thread name to threads array
+    if edit.type == "proposed_thread" and edit.action == "accept" and edit.name:
+        cls_file = run_dir / "classifications.json"
+        if cls_file.exists():
+            with open(cls_file) as f:
+                classifications = json.load(f)
+            updated = False
+            for cls in classifications:
+                if cls.get("proposed_thread") == edit.name:
+                    cls["proposed_thread"] = None
+                    existing_names = [t["name"] for t in cls.get("threads", [])]
+                    if edit.name not in existing_names:
+                        cls.setdefault("threads", []).append({
+                            "name": edit.name,
+                            "confidence": "high",
+                        })
+                    updated = True
+            if updated:
+                with open(cls_file, "w") as f:
+                    json.dump(classifications, f, indent=2)
+
+    # For reject: clear proposed_thread on matching items (they become unclassified)
+    if edit.type == "proposed_thread" and edit.action == "reject" and edit.name:
+        cls_file = run_dir / "classifications.json"
+        if cls_file.exists():
+            with open(cls_file) as f:
+                classifications = json.load(f)
+            updated = False
+            for cls in classifications:
+                if cls.get("proposed_thread") == edit.name:
+                    cls["proposed_thread"] = None
+                    updated = True
+            if updated:
+                with open(cls_file, "w") as f:
+                    json.dump(classifications, f, indent=2)
+
+    if edit.type == "proposed_thread" and edit.action in ("merge", "remap") and edit.merge_into and edit.name:
+        cls_file = run_dir / "classifications.json"
+        if cls_file.exists():
+            with open(cls_file) as f:
+                classifications = json.load(f)
+            is_defined = edit.merge_into in DEFINED_THREADS
+            updated = False
+            for cls in classifications:
+                if cls.get("proposed_thread") == edit.name:
+                    if is_defined:
+                        # Remapping to a defined thread: clear proposed_thread,
+                        # add the thread to the threads array
+                        cls["proposed_thread"] = None
+                        existing_names = [t["name"] for t in cls.get("threads", [])]
+                        if edit.merge_into not in existing_names:
+                            cls.setdefault("threads", []).append({
+                                "name": edit.merge_into,
+                                "confidence": "high",
+                            })
+                    else:
+                        # Merging into another proposed thread
+                        cls["proposed_thread"] = edit.merge_into
+                    updated = True
+            if updated:
+                with open(cls_file, "w") as f:
+                    json.dump(classifications, f, indent=2)
 
     return {"status": "saved", "total_edits": len(edits)}
 

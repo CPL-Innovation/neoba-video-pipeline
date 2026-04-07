@@ -13,8 +13,8 @@ LLM-powered classification and entity extraction tool for the NEOBA (Northeast O
 | View | Description |
 |------|-------------|
 | Run Classification | Execute Tier 1+2 (LLM) and Tier 3 (clustering) with progress tracking |
-| Review Table | Browse and inspect classified items with inline detail panels |
-| Proposed Threads | Review LLM-suggested thematic threads |
+| Review Table | Browse, search, and filter classified items with inline detail panels |
+| Proposed Threads | Review LLM-suggested threads with accept, reject, merge, and remap actions |
 | Entity Browser | Explore extracted people, places, and organizations |
 | Cluster Explorer | Visualize semantic clusters (UMAP + HDBSCAN) |
 | Cryptic Queue | Items flagged as cryptic for manual review |

@@ -1,0 +1,57 @@
+{
+  "threads": [
+    {
+      "name": "Crime & Safety",
+      "description": "Fires, police, shootings, accidents, courts, murders, arson, robberies, hostage situations, bomb threats"
+    },
+    {
+      "name": "Sports",
+      "description": "Browns, Indians, Cavaliers, golf, football, baseball, basketball, boxing, racing, athletes"
+    },
+    {
+      "name": "Weather",
+      "description": "Storms, snow, floods, forecasts, temperature, Lake Erie, blizzards, seasonal conditions"
+    },
+    {
+      "name": "Politics & Government",
+      "description": "Mayors, city council, elections, legislation, campaigns, senators, governors"
+    },
+    {
+      "name": "Economy & Labor",
+      "description": "Strikes, unions, steel, manufacturing, unemployment, plant closings, banks, business"
+    },
+    {
+      "name": "Schools & Education",
+      "description": "Schools, busing, desegregation, teachers, students, universities, school boards"
+    },
+    {
+      "name": "Health & Medicine",
+      "description": "Hospitals, doctors, diseases, clinics, public health, medical stories"
+    },
+    {
+      "name": "Culture & Arts",
+      "description": "Playhouse Square, museums, festivals, theater, concerts, music, art, galleries"
+    },
+    {
+      "name": "Community & Neighborhoods",
+      "description": "Neighborhood stories, churches, community meetings, local disputes, civic improvement"
+    },
+    {
+      "name": "Daily Life & Human Interest",
+      "description": "Holidays, parades, human interest, pets, food, family, quirky stories, consumer affairs"
+    },
+    {
+      "name": "Media & Broadcasting",
+      "description": "Newsroom operations, closers, live shots, program references, station self-reference"
+    }
+  ],
+  "genres": [
+    "reporter_package", "b_roll", "interview", "anchor_read", "live_shot",
+    "closer", "sports_highlight", "weather_segment", "editorial", "unknown"
+  ],
+  "event_types": [
+    "press_conference", "protest", "trial", "interview", "ceremony", "disaster",
+    "sports_event", "meeting", "investigation", "performance", "holiday",
+    "weather_event", "human_interest", "consumer_report", "hostage_negotiation", "other"
+  ]
+}

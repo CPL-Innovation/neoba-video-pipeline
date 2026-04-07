@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+@theme {
+  /* Background ramp */
+  --color-bg: #0c0f14;
+  --color-bg2: #12161e;
+  --color-bg3: #1a1f2b;
+  --color-surface: #222838;
+
+  /* Text ramp */
+  --color-text-primary: #e8e6e1;
+  --color-text-muted: #8a8d96;
+  --color-text-dim: #555a66;
+
+  /* Semantic accent palette */
+  --color-maize: #FFCB05;
+  --color-blue: #2d7dd2;
+  --color-coral: #e8604c;
+  --color-teal: #3cbda0;
+  --color-purple: #9882d4;
+  --color-rose: #d4728c;
+  --color-amber: #d4a03c;
+
+  /* Thread colors (11 threads mapped to distinctive hues) */
+  --color-thread-crime: #e8604c;
+  --color-thread-sports: #2d7dd2;
+  --color-thread-weather: #6baed6;
+  --color-thread-politics: #FFCB05;
+  --color-thread-economy: #d4a03c;
+  --color-thread-education: #9882d4;
+  --color-thread-health: #3cbda0;
+  --color-thread-culture: #d4728c;
+  --color-thread-community: #8dd3c7;
+  --color-thread-daily-life: #fb9a99;
+  --color-thread-media: #8a8d96;
+
+  /* Font families */
+  --font-serif: 'DM Serif Display', Georgia, serif;
+  --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-weight: 400;
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-maize);
+  color: var(--color-bg);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg2);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-text-dim);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}

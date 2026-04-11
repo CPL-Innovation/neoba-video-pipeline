@@ -49,6 +49,7 @@ interface IngestStatus {
   phase:
     | 'queued'
     | 'probing'
+    | 'extracting_audio'
     | 'detecting'
     | 'extracting'
     | 'completed'
@@ -58,11 +59,13 @@ interface IngestStatus {
   scene_count?: number
   duration?: number
   error?: string | null
+  audio_error?: string | null
 }
 
 const PHASE_LABEL: Record<IngestStatus['phase'], string> = {
   queued: 'Queued',
   probing: 'Probing duration (ffprobe)',
+  extracting_audio: 'Extracting audio track (ffmpeg)',
   detecting: 'Detecting scene boundaries (PySceneDetect)',
   extracting: 'Extracting keyframes (ffmpeg)',
   completed: 'Completed',

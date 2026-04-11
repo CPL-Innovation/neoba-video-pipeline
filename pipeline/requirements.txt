@@ -9,3 +9,5 @@ uvicorn>=0.30
 python-dotenv>=1.0
 # Video pipeline (Stage 1: ingest & segment)
 scenedetect[opencv-headless]>=0.6.7
+# Video pipeline (Stage 2: mlx-whisper transcription — Apple Silicon only)
+mlx-whisper>=0.4.0

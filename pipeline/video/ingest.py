@@ -19,6 +19,8 @@ from typing import Callable, TypedDict
 
 from scenedetect import ContentDetector, SceneManager, open_video
 
+from pipeline.video.audio import audio_path_for, extract_audio
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 VIDEO_RUNS_DIR = BASE_DIR / "data" / "runs" / "video"
 SOURCE_VIDEOS_DIR = BASE_DIR / "public" / "data" / "source" / "videos"
@@ -232,6 +234,19 @@ def run_ingest(
     # ── Stage 1a: probe duration ────────────────────────────────────────
     _emit(progress_callback, {"phase": "probing"})
     duration = probe_duration(src)
+
+    # ── Stage 1a.5: extract audio track ─────────────────────────────────
+    # Soft-fail: if the video has no audio stream or ffmpeg chokes, we
+    # still want scenes + keyframes. Stage 2 (transcribe) will surface the
+    # same error loudly if someone actually tries to transcribe this run.
+    _emit(progress_callback, {"phase": "extracting_audio"})
+    try:
+        extract_audio(src, audio_path_for(out_dir))
+    except RuntimeError as e:
+        _emit(
+            progress_callback,
+            {"phase": "extracting_audio", "audio_error": str(e)},
+        )
 
     # ── Stage 1b: detect scene boundaries ───────────────────────────────
     _emit(

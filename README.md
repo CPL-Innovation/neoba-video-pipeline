@@ -27,21 +27,27 @@ LLM-powered classification and entity extraction tool for the NEOBA (Northeast O
 
 ## Video Pipeline
 
-A second processing track for archival video content, structured as a 5-stage local-LLM pipeline. Lives alongside the text classifier as a sub-package (`pipeline/video/`) and shares the same FastAPI app, dev server, and frontend shell.
+A second processing track for archival video content, structured as a 5-stage **all-local** pipeline. Lives alongside the text classifier as a sub-package (`pipeline/video/`) and shares the same FastAPI app, dev server, and frontend shell.
 
 ### Goal
 
-Take an unannotated archival news video and progressively enrich it: cut it into scenes, describe each scene with a vision-language model, cluster scenes into recurring topics/places/people, synthesize cluster-level summaries, then surface the result for human review and correction. The end product is a structured, searchable scene index that mirrors the per-item structure the text classifier produces — but for video.
+Take an unannotated archival news video and produce Dublin-Core-compatible structured metadata — scene breakdown, transcripts, detected people/locations, thematic tags, timestamps — entirely on-device. The target output mirrors a March 25 Gemini cloud prototype, but every byte of NEOBA footage stays on CPL-owned hardware because the collection is rights-sensitive: no cloud inference, no API calls, no remote storage.
+
+The architecture is a **mostly-decomposed specialist pipeline** with Gemma 4 as the visual and synthesis brain. Decomposition is preserved (rather than collapsing everything into a single multimodal call) because Whisper large-v3 still beats any generalist on 1970s broadcast audio, Apple Vision is rock-solid at chyron/signage OCR, and auditable seams matter for archival use — when a field is wrong you want to know *which* component was wrong. Cross-video reasoning is explicitly **not** in the MVP. See [`docs/local-llm-pipeline-mvp-2026-04-11.md`](docs/local-llm-pipeline-mvp-2026-04-11.md) for the full scoping doc — rationale, model trade-offs, prompts, effort estimate, and open decisions.
 
 ### Stages
 
 | # | Stage | Purpose | Tools |
 |---|-------|---------|-------|
-| 1 | **Ingest & Segment** | Probe duration, detect scene boundaries, extract start/mid/end keyframes per scene | `ffprobe`, PySceneDetect (`ContentDetector`), `ffmpeg` |
-| 2 | **Extract** | Per-scene vision-language captioning + entity/object extraction from keyframes | Local VLM (planned: Qwen2-VL / LLaVA via Ollama) |
-| 3 | **Cluster** | Group semantically similar scenes across the corpus into recurring topics, locations, people | Embedding model + UMAP + HDBSCAN (mirrors text Tier 3) |
-| 4 | **Synthesize** | LLM-generated cluster summaries, suggested labels, candidate threads | Local LLM (planned: Llama 3 / Qwen via Ollama) |
-| 5 | **Review** | Human-in-the-loop UI for accepting/rejecting/merging clusters and correcting captions | Frontend only |
+| 1 | **Ingest & Segment** | Extract audio track, detect scene boundaries, pick 1–3 keyframes per scene | `ffmpeg`, `ffprobe`, PySceneDetect (`ContentDetector`) |
+| 2 | **Per-modality extraction** | Run specialist models in parallel on audio + keyframes | mlx-whisper (large-v3-turbo) for transcripts; **Gemma 4 E4B** via MLX as primary VLM with **Qwen2.5-VL-7B** as A/B backend; Apple Vision for OCR; InsightFace (`buffalo_l`) for face embeddings |
+| 3 | **Cluster & aggregate** | Cluster face embeddings within a video, attach transcript segments to scenes by timestamp, build per-scene fact bundles (the "evidence packet" for Stage 4) | DBSCAN (cosine) on face embeddings, timestamp intersection |
+| 4 | **LLM synthesis** | Read per-scene fact bundles and emit Dublin-Core-compatible JSON via schema-constrained output | **Gemma 4 26B A4B** (MoE, Q4_K_M) via Ollama as primary; **Qwen2.5-14B-Instruct** (Q4_K_M) as 16 GB / tooling-instability fallback |
+| 5 | **Store & review** | Persist outputs non-destructively and expose for human-in-the-loop review, flagging low-confidence fields (locations, named people) for SME validation | SQLite index + per-video JSON sidecars, review UI reusing the classifier frontend shell |
+
+#### Ambitious variant: collapsed Stage 2+4
+
+Because Gemma 4 26B A4B natively accepts video and audio, a second track worth prototyping *after* the decomposed path works is feeding Gemma 4 the raw video directly and asking it to emit the structured JSON in one call — collapsing Stages 2 and 4. Whisper still runs in parallel (better transcriber) and its output gets passed into Gemma 4's text context alongside the video. Head-to-head comparison against the decomposed path, not a replacement.
 
 ### Stage 1 — Ingest & Segment (implemented)
 
@@ -74,7 +80,14 @@ Real, working end-to-end. Drop a video into `public/data/source/videos/`, pick i
 
 ### Stages 2–5 (planned)
 
-Sidebar entries and route stubs exist for **Extract**, **Cluster**, **Synthesize**, and **Review** under `src/views/VideoPipeline/`. Each currently renders a "not built yet" placeholder. Backend modules will be added under `pipeline/video/` as siblings to `ingest.py` (e.g. `extract.py`, `cluster.py`, `synthesize.py`) and mounted on the same router.
+Sidebar entries and route stubs exist for **Extract**, **Cluster**, **Synthesize**, and **Review** under `src/views/VideoPipeline/`. Each currently renders a "not built yet" placeholder. Backend modules will be added under `pipeline/video/` as siblings to `ingest.py` and mounted on the same router:
+
+- `extract.py` — Stage 2 orchestrator that dispatches a scene's audio + keyframes to the specialist backends (mlx-whisper, the VLM backend, Apple Vision OCR, InsightFace) behind a common interface. The VLM backend is deliberately swappable so Gemma 4 E4B and Qwen2.5-VL-7B can be A/B tested on the same clips for caption quality, OCR pickup, temporal coherence, and throughput.
+- `aggregate.py` — Stage 3 face DBSCAN + transcript-to-scene time alignment + per-scene fact-bundle assembly.
+- `synthesize.py` — Stage 4 Ollama client (Gemma 4 26B A4B primary, Qwen2.5-14B fallback) with JSON-schema-constrained output. Emits the Dublin-Core-compatible metadata document.
+- `store.py` — Stage 5 SQLite index + JSON sidecar writer. Sidecars stay next to the source video, non-destructively, per Ben's "indexes not transforms" philosophy.
+
+Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidence fields (especially named people and Cleveland landmarks) for SME review before anything becomes public. Known weak points vs. the Gemini prototype are named-entity recognition on historic Cleveland figures and landmark geolocation — mitigated by building a gazetteer of NEOBA-relevant names/places from the April 7 text-classifier entity run and injecting it as context into the VLM and synthesis prompts.
 
 ### Current dev status
 
@@ -83,11 +96,17 @@ Sidebar entries and route stubs exist for **Extract**, **Cluster**, **Synthesize
 | Sidebar restructure (collapsible Classifier + Video Pipeline groups, Model Compare leaf) | Done |
 | Backend sub-package layout (`pipeline/video/`) wired into existing FastAPI app | Done |
 | Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg | Done |
+| Stage 1 ingest — audio track extraction (`audio.wav`, 16 kHz mono PCM) | Done |
 | Stage 1 frontend — run, poll, preview keyframes, preview scene clips | Done |
-| Stage 2 Extract (VLM captioning) | Stub view, not implemented |
-| Stage 3 Cluster (embeddings + UMAP + HDBSCAN) | Stub view, not implemented |
-| Stage 4 Synthesize (LLM cluster summaries) | Stub view, not implemented |
-| Stage 5 Review (human-in-the-loop UI) | Stub view, not implemented |
+| Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
+| Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
+| Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |
+| Stage 2 Extract — Apple Vision OCR on keyframes | Stub view, not implemented |
+| Stage 2 Extract — InsightFace face detection + embeddings | Stub view, not implemented |
+| Stage 3 Aggregate — face DBSCAN + transcript/scene time alignment + fact bundles | Stub view, not implemented |
+| Stage 4 Synthesize — Gemma 4 26B A4B via Ollama, schema-constrained JSON | Stub view, not implemented |
+| Stage 5 Store & Review — SQLite index + JSON sidecars + review UI | Stub view, not implemented |
+| Collapsed Stage 2+4 variant (Gemma 4 native-video path) | Not started (prototype after decomposed path works) |
 | Model Compare sibling view | Stub, not implemented |
 
 ## Setup

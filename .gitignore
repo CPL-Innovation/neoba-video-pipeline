@@ -38,3 +38,6 @@ __pycache__/
 # Pipeline output
 data/runs/
 data/exports/
+
+# Video pipeline source media (large binaries — not tracked in git)
+public/data/source/videos/

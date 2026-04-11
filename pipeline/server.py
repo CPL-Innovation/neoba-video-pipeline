@@ -2,9 +2,16 @@
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
+
+# Make `pipeline.*` importable when this file is launched directly
+# (`python pipeline/server.py`) from any cwd.
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -12,7 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env", override=True)
 DATA_DIR = BASE_DIR / "data"
 
@@ -24,6 +30,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Video pipeline routes (Stage 1+ live under pipeline/video/)
+from pipeline.video.router import router as video_router  # noqa: E402
+app.include_router(video_router)
 
 # Track running jobs
 running_jobs: dict[str, dict] = {}
@@ -592,8 +602,5 @@ async def run_export(run_id: str):
 # --- Main ---
 
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, str(BASE_DIR))
-
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

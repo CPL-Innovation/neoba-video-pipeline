@@ -34,11 +34,12 @@ const sections: NavEntry[] = [
     ],
   },
   {
-    kind: 'link',
-    id: 'model-compare',
-    label: 'Model Compare',
-    to: '/model-compare',
-    icon: '⇄',
+    kind: 'group',
+    id: 'utility',
+    label: 'Utility',
+    items: [
+      { to: '/model-compare', label: 'Model Compare', icon: '⇄' },
+    ],
   },
 ]
 

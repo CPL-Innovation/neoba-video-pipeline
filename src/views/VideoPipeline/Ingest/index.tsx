@@ -23,6 +23,14 @@ interface Scene {
   tags?: string[]
 }
 
+interface VlmAnalysis {
+  summary: string
+  full_analysis: string
+  model: string
+  prompt: string
+  analyzed_at: string
+}
+
 interface Segment {
   segment_id: string
   type: 'content' | 'boundary'
@@ -30,6 +38,7 @@ interface Segment {
   scene_ids: string[]
   start: number
   end: number
+  vlm_analysis?: VlmAnalysis
 }
 
 interface TranscriptSegment {
@@ -485,6 +494,14 @@ export function Ingest() {
   const [currentPlaybackTime, setCurrentPlaybackTime] = useState<number | null>(
     null,
   )
+  const [vlmPromptSegmentId, setVlmPromptSegmentId] = useState<string | null>(
+    null,
+  )
+  const [vlmPrompt, setVlmPrompt] = useState(
+    'Analyze this archival video segment. Describe: (1) what is visually happening, (2) any identifiable people, locations, or text on screen, (3) the apparent era and production style, (4) the type of content (interview, b-roll, news report, etc.).',
+  )
+  const [vlmRunning, setVlmRunning] = useState<string | null>(null)
+  const [showVlmAnalysis, setShowVlmAnalysis] = useState(false)
 
   const isRunning = status?.status === 'running'
   const previewScene = result?.scenes.find(
@@ -870,6 +887,54 @@ export function Ingest() {
       else next.add(segmentId)
       return next
     })
+  }
+
+  const runVlmAnalysis = async (segmentId: string) => {
+    if (!result) return
+    setVlmRunning(segmentId)
+    setVlmPromptSegmentId(null)
+    setError(null)
+    try {
+      // Kick off background job
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/segments/${segmentId}/analyze`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: vlmPrompt }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res
+          .json()
+          .catch(() => ({ detail: 'VLM analysis failed' }))
+        throw new Error(err.detail || 'VLM analysis failed')
+      }
+      // Poll for completion
+      const pollUrl = `/api/video/videos/${result.video_id}/segments/${segmentId}/analyze/status`
+      while (true) {
+        await new Promise((r) => setTimeout(r, 3000))
+        const statusRes = await fetch(pollUrl)
+        if (!statusRes.ok) continue
+        const status = await statusRes.json()
+        if (status.status === 'completed') {
+          // Refresh scenes to pick up the stored result
+          const scenesRes = await fetch(
+            `/api/video/videos/${result.video_id}/scenes`,
+          )
+          if (scenesRes.ok) setResult(await scenesRes.json())
+          setShowVlmAnalysis(true)
+          break
+        }
+        if (status.status === 'failed') {
+          throw new Error(status.error || 'VLM analysis failed')
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setVlmRunning(null)
+    }
   }
 
   // ── Data fetching ─────────────────────────────────────────────────────
@@ -1365,7 +1430,7 @@ export function Ingest() {
               return (
                 <div key={scene.scene_id}>
                   {/* Segment header */}
-                  {isFirstInSegment && segment && (
+                  {isFirstInSegment && segment && (<>
                     <div
                       className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
                         previewSegmentId === segment.segment_id
@@ -1433,8 +1498,72 @@ export function Ingest() {
                         {' · '}
                         {fmtTime(segment.start)}→{fmtTime(segment.end)}
                       </span>
+                      {segment.vlm_analysis && (
+                        <span className="shrink-0 w-2 h-2 rounded-full bg-violet-400" title={segment.vlm_analysis.summary} />
+                      )}
+                      {segment.type === 'content' && (
+                        <button
+                          type="button"
+                          title="VLM Analyze"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setVlmPromptSegmentId(
+                              vlmPromptSegmentId === segment.segment_id
+                                ? null
+                                : segment.segment_id,
+                            )
+                          }}
+                          className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+                            vlmRunning === segment.segment_id
+                              ? 'bg-violet-500/20 text-violet-300 animate-pulse'
+                              : vlmPromptSegmentId === segment.segment_id
+                                ? 'bg-violet-500/20 text-violet-300'
+                                : 'bg-white/5 text-text-dim hover:text-violet-300 hover:bg-violet-500/10'
+                          }`}
+                          disabled={vlmRunning !== null}
+                        >
+                          {vlmRunning === segment.segment_id ? '...' : '✦'}
+                        </button>
+                      )}
                     </div>
-                  )}
+                    {/* VLM prompt editor */}
+                    {vlmPromptSegmentId === segment.segment_id && (
+                      <div
+                        className="mx-2 mb-1 p-2 rounded-md border border-violet-500/20 bg-violet-500/5 space-y-2"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <textarea
+                          value={vlmPrompt}
+                          onChange={(e) => setVlmPrompt(e.target.value)}
+                          rows={3}
+                          className="w-full bg-bg3 border border-white/10 rounded px-2 py-1.5 text-xs text-text-primary resize-y focus:outline-none focus:border-violet-500/40"
+                          placeholder="Enter analysis prompt..."
+                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => runVlmAnalysis(segment.segment_id)}
+                            disabled={vlmRunning !== null || !vlmPrompt.trim()}
+                            className="px-3 py-1 rounded text-xs font-medium bg-violet-500/20 text-violet-300 hover:bg-violet-500/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {vlmRunning === segment.segment_id
+                              ? 'Analyzing...'
+                              : 'Run VLM'}
+                          </button>
+                          <span className="text-[10px] text-text-dim">
+                            gemma4:e4b via Ollama
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setVlmPromptSegmentId(null)}
+                            className="ml-auto text-[10px] text-text-dim hover:text-text-muted"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </>)}
 
                   {/* Scene row (skip if collapsed) */}
                   {!isCollapsed && (
@@ -1727,6 +1856,152 @@ export function Ingest() {
                             if (v) v.currentTime = t
                           }}
                         />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* VLM Analysis toggle + display */}
+                {previewSegment.type === 'content' && (
+                  <div>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowVlmAnalysis((v) => !v)}
+                        className={`text-xs px-2 py-1 rounded border ${
+                          showVlmAnalysis
+                            ? 'border-violet-400/40 bg-violet-500/10 text-violet-300'
+                            : 'border-white/10 text-text-dim hover:text-text-muted'
+                        }`}
+                      >
+                        VLM Analysis
+                        {previewSegment.vlm_analysis && ' ✦'}
+                      </button>
+                      {!previewSegment.vlm_analysis && !showVlmAnalysis && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setVlmPromptSegmentId(previewSegment.segment_id)
+                            setShowVlmAnalysis(true)
+                          }}
+                          className="text-xs px-2 py-1 rounded border border-violet-500/20 text-violet-300/60 hover:text-violet-300 hover:bg-violet-500/10 transition-colors"
+                        >
+                          Analyze
+                        </button>
+                      )}
+                    </div>
+                    {showVlmAnalysis && (
+                      <div className="mt-2 border-t border-white/5 pt-2 space-y-3">
+                        {previewSegment.vlm_analysis ? (
+                          <>
+                            <p className="text-xs text-text-primary whitespace-pre-wrap leading-relaxed">
+                              {previewSegment.vlm_analysis.full_analysis}
+                            </p>
+                            <details className="text-[10px] text-text-dim">
+                              <summary className="cursor-pointer hover:text-text-muted">
+                                {previewSegment.vlm_analysis.model} · {previewSegment.vlm_analysis.analyzed_at}
+                              </summary>
+                              <p className="mt-1 pl-3 border-l border-white/5 text-text-dim whitespace-pre-wrap">
+                                {previewSegment.vlm_analysis.prompt}
+                              </p>
+                            </details>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setVlmPromptSegmentId(
+                                  vlmPromptSegmentId === previewSegment.segment_id
+                                    ? null
+                                    : previewSegment.segment_id,
+                                )
+                              }
+                              className="text-[10px] px-2 py-0.5 rounded border border-violet-500/20 text-violet-300/60 hover:text-violet-300 transition-colors"
+                            >
+                              Re-analyze
+                            </button>
+                            {vlmPromptSegmentId === previewSegment.segment_id && (
+                              <div className="p-2 rounded-md border border-violet-500/20 bg-violet-500/5 space-y-2">
+                                <textarea
+                                  value={vlmPrompt}
+                                  onChange={(e) => setVlmPrompt(e.target.value)}
+                                  rows={3}
+                                  className="w-full bg-bg3 border border-white/10 rounded px-2 py-1.5 text-xs text-text-primary resize-y focus:outline-none focus:border-violet-500/40"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      runVlmAnalysis(previewSegment.segment_id)
+                                    }
+                                    disabled={vlmRunning !== null || !vlmPrompt.trim()}
+                                    className="px-3 py-1 rounded text-xs font-medium bg-violet-500/20 text-violet-300 hover:bg-violet-500/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                  >
+                                    {vlmRunning === previewSegment.segment_id
+                                      ? 'Analyzing...'
+                                      : 'Run VLM'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setVlmPromptSegmentId(null)}
+                                    className="text-[10px] text-text-dim hover:text-text-muted"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          <div className="space-y-2">
+                            <p className="text-xs text-text-dim italic">
+                              No analysis yet. Run VLM to analyze this segment.
+                            </p>
+                            {vlmPromptSegmentId !== previewSegment.segment_id && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setVlmPromptSegmentId(previewSegment.segment_id)
+                                }
+                                className="px-3 py-1 rounded text-xs font-medium bg-violet-500/20 text-violet-300 hover:bg-violet-500/30 transition-colors"
+                              >
+                                Analyze with VLM
+                              </button>
+                            )}
+                            {vlmPromptSegmentId === previewSegment.segment_id && (
+                              <div className="p-2 rounded-md border border-violet-500/20 bg-violet-500/5 space-y-2">
+                                <textarea
+                                  value={vlmPrompt}
+                                  onChange={(e) => setVlmPrompt(e.target.value)}
+                                  rows={3}
+                                  className="w-full bg-bg3 border border-white/10 rounded px-2 py-1.5 text-xs text-text-primary resize-y focus:outline-none focus:border-violet-500/40"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      runVlmAnalysis(previewSegment.segment_id)
+                                    }
+                                    disabled={vlmRunning !== null || !vlmPrompt.trim()}
+                                    className="px-3 py-1 rounded text-xs font-medium bg-violet-500/20 text-violet-300 hover:bg-violet-500/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                  >
+                                    {vlmRunning === previewSegment.segment_id
+                                      ? 'Analyzing...'
+                                      : 'Run VLM'}
+                                  </button>
+                                  <span className="text-[10px] text-text-dim">
+                                    gemma4:e4b via Ollama
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setVlmPromptSegmentId(null)}
+                                    className="ml-auto text-[10px] text-text-dim hover:text-text-muted"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

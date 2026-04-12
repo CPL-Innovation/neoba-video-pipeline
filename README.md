@@ -104,6 +104,17 @@ Segments are narrative units made of scenes, detected via black-slug analysis. B
 - **Subtitle overlay**: When `transcript.json` exists, subtitles display automatically on the video player during playback, synced to scene/segment time bounds. Subtitles update in real-time after transcript edits.
 - **Click-to-seek**: Click a transcript segment's timestamp to jump the video to that position.
 
+**VLM segment analysis** (`pipeline/video/vlm.py`)
+
+On-demand visual understanding of segments via Ollama multimodal models. A modular module designed for reuse at scene or segment level.
+
+- `analyze_segment()` — collects keyframes (capped at 6, evenly sampled), transcript text overlapping the segment's time range, and metadata (name, type, duration, scene count). Sends as a multimodal prompt to Ollama and persists the result.
+- `_ollama_chat()` — wraps the Ollama `/api/chat` endpoint with base64 image support. Uses stdlib `urllib` (no extra dependencies).
+- Default model: **Gemma 4 E4B** via Ollama (multimodal, ~9 GB). Configurable per-request.
+- Default prompt is an archival analysis template (visual content, people/locations, era, content type). Fully editable from the UI before each run.
+- Results stored directly on the segment object in `scenes.json` as `vlm_analysis: { summary, full_analysis, model, prompt, analyzed_at }`.
+- Runs in a background thread (same pattern as ingest/transcribe) with status polling, since inference takes ~1 min per image on Apple Silicon.
+
 **Backend HTTP** (`pipeline/video/router.py`, mounted at `/api/video`)
 - `GET /source-videos` — list videos in `public/data/source/videos/`
 - `GET /videos` — list ingested runs
@@ -121,6 +132,8 @@ Segments are narrative units made of scenes, detected via black-slug analysis. B
 - `POST /videos/{video_id}/segments/detect` — detect black slugs and group scenes into segments
 - `PATCH /videos/{video_id}/segments/{segment_id}/rename` — rename a segment
 - `DELETE /videos/{video_id}/segments` — clear all segment grouping data (preserves scene tags)
+- `POST /videos/{video_id}/segments/{segment_id}/analyze` — kick off VLM analysis in background thread, returns `{ status: "started" }`
+- `GET /videos/{video_id}/segments/{segment_id}/analyze/status` — poll VLM job status (`running` → `completed` / `failed`)
 - `GET /tags` — list valid scene tags from `pipeline/video/tags.json`
 - `PATCH /videos/{video_id}/transcript/segments` — edit or delete transcript segments
 - `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
@@ -134,7 +147,8 @@ Two-level master-detail navigation:
   - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and segment type filter (All/Content/Boundary with counts) for isolating segments. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, scene count, and time range. Merge action bar at bottom.
   - **Right panel (45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check.
   - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
-  - Click segment header → collapse/expand + segment preview; "Detect Segments" / "Clear Segments" button in header
+  - Click segment header → collapse/expand + segment preview; "Detect Segments" / "Clear Segments" button in header; ✦ VLM analyze button on content segments opens inline prompt editor
+  - **VLM Analysis panel**: Toggle in segment detail view. Shows full analysis text, model/timestamp metadata, prompt used (collapsible), and re-analyze button. Purple dot indicator on segment bar when analysis exists.
   - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
   - "Apply All Merges" button appears when pending merges exist
 
@@ -153,7 +167,7 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 
 | Area | Status |
 |---|---|
-| Sidebar restructure (collapsible Catalog Classifier + Video Pipeline groups, Model Compare leaf) | Done |
+| Sidebar restructure (collapsible Catalog Classifier + Video Pipeline + Utility groups) | Done |
 | Backend sub-package layout (`pipeline/video/`) wired into existing FastAPI app | Done |
 | Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
 | Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
@@ -164,6 +178,7 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 | Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, scene-scoped video player with subtitles, segment headers, keyframe grid, duration + segment filters, inline rename, tag assignment, trim buttons) | Done |
 | Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
 | Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
+| VLM segment analysis — on-demand Gemma 4 E4B via Ollama, multimodal (keyframes + transcript + metadata), editable prompt, async background job with polling, results in segment bar + detail panel | Done |
 | Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |
 | Stage 2 Extract — Apple Vision OCR on keyframes | Stub view, not implemented |
 | Stage 2 Extract — InsightFace face detection + embeddings | Stub view, not implemented |
@@ -200,6 +215,14 @@ The video pipeline (Stage 1) also requires `ffmpeg` and `ffprobe` on `PATH`:
 ```bash
 brew install ffmpeg          # macOS
 # or: sudo apt install ffmpeg
+```
+
+VLM segment analysis requires [Ollama](https://ollama.com/) with a vision-capable model:
+
+```bash
+brew install ollama          # macOS
+ollama pull gemma4:e4b       # ~9 GB, multimodal (text + image)
+ollama serve                 # starts on http://localhost:11434
 ```
 
 The Vite dev server proxies `/api` requests to the backend.

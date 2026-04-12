@@ -45,6 +45,11 @@ from pipeline.video.transcribe import (
     transcript_path_for,
 )
 from pipeline.video.transcript_cleanup import clean_segments
+from pipeline.video.vlm import (
+    DEFAULT_MODEL as VLM_DEFAULT_MODEL,
+    DEFAULT_PROMPT as VLM_DEFAULT_PROMPT,
+    analyze_segment as vlm_analyze_segment,
+)
 
 router = APIRouter(prefix="/api/video", tags=["video"])
 
@@ -720,3 +725,96 @@ async def clear_segments_endpoint(video_id: str):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)
+
+
+# ── VLM analysis ──────────────────────────────────────────────────────────
+
+vlm_jobs: dict[str, dict[str, Any]] = {}
+_vlm_lock = threading.Lock()
+
+
+def _set_vlm_job(job_key: str, **fields: Any) -> None:
+    with _vlm_lock:
+        job = vlm_jobs.setdefault(job_key, {})
+        job.update(fields)
+
+
+def _get_vlm_job(job_key: str) -> dict[str, Any] | None:
+    with _vlm_lock:
+        job = vlm_jobs.get(job_key)
+        return dict(job) if job else None
+
+
+class VlmAnalyzeRequest(BaseModel):
+    prompt: str = VLM_DEFAULT_PROMPT
+    model: str = VLM_DEFAULT_MODEL
+
+
+@router.post("/videos/{video_id}/segments/{segment_id}/analyze")
+async def analyze_segment_endpoint(
+    video_id: str, segment_id: str, req: VlmAnalyzeRequest
+):
+    """Kick off VLM analysis in a background thread.
+
+    Returns immediately with status='started'. Poll
+    GET /api/video/videos/{video_id}/segments/{segment_id}/analyze/status
+    for progress.
+    """
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+
+    job_key = f"{video_id}/{segment_id}"
+    existing = _get_vlm_job(job_key)
+    if existing and existing.get("status") == "running":
+        raise HTTPException(409, f"VLM analysis already running for {segment_id}")
+
+    _set_vlm_job(
+        job_key,
+        status="running",
+        video_id=video_id,
+        segment_id=segment_id,
+        error=None,
+        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+
+    def worker() -> None:
+        try:
+            vlm_analyze_segment(
+                video_id,
+                segment_id,
+                prompt=req.prompt,
+                model=req.model,
+            )
+            _set_vlm_job(
+                job_key,
+                status="completed",
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+        except Exception as e:
+            _set_vlm_job(
+                job_key,
+                status="failed",
+                error=str(e),
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"video_id": video_id, "segment_id": segment_id, "status": "started"}
+
+
+@router.get("/videos/{video_id}/segments/{segment_id}/analyze/status")
+async def get_vlm_status(video_id: str, segment_id: str):
+    """Poll VLM analysis status."""
+    job_key = f"{video_id}/{segment_id}"
+    job = _get_vlm_job(job_key)
+    if job is not None:
+        return job
+    # Check if result exists on disk
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    segments = result.get("segments", [])
+    seg = next((s for s in segments if s["segment_id"] == segment_id), None)
+    if seg and seg.get("vlm_analysis"):
+        return {"status": "completed", "video_id": video_id, "segment_id": segment_id}
+    raise HTTPException(404, f"No VLM job or result for {segment_id}")

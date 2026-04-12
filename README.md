@@ -72,10 +72,17 @@ Users can consolidate adjacent scenes from the UI. The system uses a two-phase c
 
 Key design points:
 - `merges.json` sidecar tracks groups, their member scene IDs, and status (`pending` | `committed`)
+- Merged scenes inherit the first constituent scene's ID (e.g., merging `_scene_007` + `_scene_008` + `_scene_009` → `_scene_007`), not a synthetic `_group_NNN` name
+- After apply, merged scenes are indistinguishable from raw scenes — `merged_from` and `merge_status` metadata is stripped
 - Group absorption: merging a pending group with adjacent scenes creates a larger group
 - Committed groups are frozen — cannot be absorbed or unmerged
 - Contiguity validation: only adjacent scenes in the raw scene list can be merged
 - v1→v2 migration: old sidecars without status fields default to "committed"
+
+**Scene editing** (`pipeline/video/ingest.py`)
+
+- **Inline rename**: Double-click a scene name in the UI to rename it. Updates `scenes.json` and `merges.json` references.
+- **Keyframe deletion**: Remove unwanted keyframes from scenes (useful after merging). Deletes both the JSON entry and the image file on disk. The last keyframe in a scene cannot be deleted.
 
 **Backend HTTP** (`pipeline/video/router.py`, mounted at `/api/video`)
 - `GET /source-videos` — list videos in `public/data/source/videos/`
@@ -86,6 +93,8 @@ Key design points:
 - `POST /videos/{video_id}/merges` — create a pending merge group from contiguous scene IDs
 - `DELETE /videos/{video_id}/merges/{group_id}` — unmerge a pending group (409 for committed)
 - `POST /videos/{video_id}/merges/apply` — bake all merges into `scenes.json` (irreversible)
+- `PATCH /videos/{video_id}/scenes/rename` — rename a scene (updates `scenes.json` + `merges.json`)
+- `POST /videos/{video_id}/scenes/delete-keyframe` — remove a keyframe from a scene (JSON entry + image file)
 - `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
 
 **Frontend** (`src/views/VideoPipeline/Ingest/index.tsx`)
@@ -94,8 +103,8 @@ Two-level master-detail navigation:
 
 - **Level 1 — Video list**: Run Ingest form + Ingested Videos list. Click a video to drill in.
 - **Level 2 — Scene browser**: Side-by-side layout with back navigation.
-  - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID, merge status badge, time range, duration, and ✕ unmerge button. Merge action bar at bottom.
-  - **Right panel (45%)**: Video player (time-bounded to selected scene via Media Fragment URI), scene metadata, and 3-column keyframe grid.
+  - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range, duration, and ✕ unmerge button. Duration filter (min/max seconds) for isolating short segments. Merge action bar at bottom.
+  - **Right panel (45%)**: Scene-scoped video player (custom controls with seek bar, play/pause, and time display mapped to the scene's time range — not the full video duration), scene metadata, and 3-column keyframe grid with hover ✕ buttons for deleting unwanted keyframes.
   - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
   - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
   - "Apply All Merges" button appears when pending merges exist
@@ -119,8 +128,9 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 | Backend sub-package layout (`pipeline/video/`) wired into existing FastAPI app | Done |
 | Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
 | Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
-| Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json` | Done |
-| Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, video preview, keyframe grid) | Done |
+| Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json`, merged scenes named after first constituent | Done |
+| Stage 1 scene editing — inline rename (double-click), keyframe deletion (hover ✕, removes JSON entry + image file) | Done |
+| Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, scene-scoped video player, keyframe grid, duration filter, inline rename) | Done |
 | Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
 | Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
 | Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |

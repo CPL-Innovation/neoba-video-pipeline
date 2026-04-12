@@ -256,9 +256,11 @@ def merge_scenes(video_id: str, scene_ids: list[str]) -> MergesSidecar:
 
     # Build the new group, dropping any absorbed ones. New groups always
     # start pending — the user has to explicitly Apply all to commit.
-    new_index = merges["next_group_index"]
+    # Name the merged scene after the first (smallest index) constituent
+    # scene, so merging _007 + _008 + _009 produces _007 rather than a
+    # synthetic group_NNN identifier.
     new_group: MergeGroup = {
-        "group_id": f"{video_id}_group_{new_index:03d}",
+        "group_id": sorted_ids[0],
         "scene_ids": sorted_ids,
         "status": "pending",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -267,7 +269,6 @@ def merge_scenes(video_id: str, scene_ids: list[str]) -> MergesSidecar:
         g for g in merges["groups"] if g["group_id"] not in absorbed_group_ids
     ]
     merges["groups"].append(new_group)
-    merges["next_group_index"] = new_index + 1
 
     save_merges(video_id, merges)
     return merges
@@ -291,6 +292,85 @@ def unmerge_group(video_id: str, group_id: str) -> MergesSidecar:
     ]
     save_merges(video_id, merges)
     return merges
+
+
+def delete_keyframe(video_id: str, scene_id: str, keyframe_path: str) -> None:
+    """Remove a keyframe from a scene in scenes.json.
+
+    Identifies the keyframe by its path field. Refuses to delete the last
+    remaining keyframe in a scene.
+    """
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    scene = next((s for s in result["scenes"] if s["scene_id"] == scene_id), None)
+    if scene is None:
+        raise ValueError(f"Unknown scene_id: {scene_id}")
+
+    before = len(scene["keyframes"])
+    scene["keyframes"] = [kf for kf in scene["keyframes"] if kf["path"] != keyframe_path]
+    if len(scene["keyframes"]) == before:
+        raise ValueError(f"Keyframe not found: {keyframe_path}")
+    if len(scene["keyframes"]) == 0:
+        raise ValueError("Cannot delete the last keyframe in a scene")
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    # Delete the actual image file from disk
+    img_file = run_dir / keyframe_path
+    if img_file.exists():
+        img_file.unlink()
+
+
+def rename_scene(video_id: str, old_id: str, new_id: str) -> None:
+    """Rename a scene in scenes.json and any matching merge group in merges.json.
+
+    Works for both raw scenes and baked merged scenes. If the scene is
+    referenced inside a merge group (as group_id or in scene_ids), those
+    references are updated too.
+    """
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    # Check new_id doesn't collide with an existing scene
+    existing_ids = {s["scene_id"] for s in result["scenes"]}
+    if new_id in existing_ids and new_id != old_id:
+        raise ValueError(f"Scene ID '{new_id}' already exists")
+
+    # Rename in scenes.json
+    found = False
+    for s in result["scenes"]:
+        if s["scene_id"] == old_id:
+            s["scene_id"] = new_id
+            found = True
+        # Also update merged_from references
+        mf = s.get("merged_from")
+        if mf:
+            s["merged_from"] = [new_id if sid == old_id else sid for sid in mf]  # type: ignore[typeddict-unknown-key]
+
+    if not found:
+        raise ValueError(f"Unknown scene_id: {old_id}")
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    # Rename in merges.json sidecar (group_id and scene_ids references)
+    merges = load_merges(video_id)
+    changed = False
+    for g in merges["groups"]:
+        if g["group_id"] == old_id:
+            g["group_id"] = new_id
+            changed = True
+        if old_id in g["scene_ids"]:
+            g["scene_ids"] = [new_id if sid == old_id else sid for sid in g["scene_ids"]]
+            changed = True
+    if changed:
+        save_merges(video_id, merges)
 
 
 def apply_all_merges(video_id: str) -> IngestResult:
@@ -318,12 +398,12 @@ def apply_all_merges(video_id: str) -> IngestResult:
     run_dir = VIDEO_RUNS_DIR / video_id
     scenes_file = run_dir / "scenes.json"
 
-    # Apply all merges and mark baked scenes as committed so the
-    # frontend renders the teal "merged" badge (not the maize "pending").
+    # Apply all merges and strip merge metadata — once baked, merged
+    # scenes are indistinguishable from raw scenes in scenes.json.
     merged_scenes = apply_merges(result["scenes"], merges)
     for s in merged_scenes:
-        if s.get("merge_status"):  # type: ignore[arg-type]
-            s["merge_status"] = "committed"  # type: ignore[typeddict-unknown-key]
+        s.pop("merge_status", None)  # type: ignore[misc]
+        s.pop("merged_from", None)  # type: ignore[misc]
 
     result["scenes"] = merged_scenes
     result["scene_count"] = len(merged_scenes)

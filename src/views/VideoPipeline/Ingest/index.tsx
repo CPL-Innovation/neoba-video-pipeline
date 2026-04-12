@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { PageHeader } from '../../../components/PageHeader'
 import { Card } from '../../../components/Card'
 import { Button } from '../../../components/Button'
@@ -116,6 +116,154 @@ function keyframeUrl(videoId: string, kf: Keyframe): string {
   return `/api/video/videos/${videoId}/keyframes/${filename}`
 }
 
+// ── Scene-scoped video player ───────────────────────────────────────────
+
+function ScenePlayer({
+  src,
+  sceneStart,
+  sceneEnd,
+}: {
+  src: string
+  sceneStart: number
+  sceneEnd: number
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const trackRef = useRef<HTMLDivElement>(null)
+  const [playing, setPlaying] = useState(false)
+  const [currentTime, setCurrent] = useState(0) // relative to sceneStart
+  const [dragging, setDragging] = useState(false)
+  const sceneDuration = sceneEnd - sceneStart
+
+  // Clamp video to scene bounds
+  const clamp = useCallback(() => {
+    const v = videoRef.current
+    if (!v) return
+    if (v.currentTime < sceneStart) v.currentTime = sceneStart
+    if (v.currentTime >= sceneEnd) {
+      v.currentTime = sceneStart
+      v.pause()
+      setPlaying(false)
+    }
+  }, [sceneStart, sceneEnd])
+
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const onTime = () => {
+      clamp()
+      setCurrent(v.currentTime - sceneStart)
+    }
+    const onPause = () => setPlaying(false)
+    const onPlay = () => setPlaying(true)
+    v.addEventListener('timeupdate', onTime)
+    v.addEventListener('pause', onPause)
+    v.addEventListener('play', onPlay)
+    return () => {
+      v.removeEventListener('timeupdate', onTime)
+      v.removeEventListener('pause', onPause)
+      v.removeEventListener('play', onPlay)
+    }
+  }, [sceneStart, clamp])
+
+  // Reset on scene change
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    v.currentTime = sceneStart
+    setCurrent(0)
+    setPlaying(false)
+  }, [src, sceneStart, sceneEnd])
+
+  const togglePlay = () => {
+    const v = videoRef.current
+    if (!v) return
+    if (v.paused) {
+      if (v.currentTime >= sceneEnd - 0.1) v.currentTime = sceneStart
+      v.play()
+    } else {
+      v.pause()
+    }
+  }
+
+  const seekFromEvent = (e: React.MouseEvent | MouseEvent) => {
+    const track = trackRef.current
+    const v = videoRef.current
+    if (!track || !v) return
+    const rect = track.getBoundingClientRect()
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    v.currentTime = sceneStart + pct * sceneDuration
+    setCurrent(pct * sceneDuration)
+  }
+
+  const onTrackDown = (e: React.MouseEvent) => {
+    e.preventDefault()
+    setDragging(true)
+    seekFromEvent(e)
+    const onMove = (ev: MouseEvent) => seekFromEvent(ev)
+    const onUp = () => {
+      setDragging(false)
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  const pct = sceneDuration > 0 ? (currentTime / sceneDuration) * 100 : 0
+
+  return (
+    <div className="relative rounded border border-white/10 bg-black overflow-hidden">
+      <video
+        ref={videoRef}
+        src={`${src}#t=${sceneStart.toFixed(3)},${sceneEnd.toFixed(3)}`}
+        preload="metadata"
+        className="w-full block"
+        onClick={togglePlay}
+      />
+
+      {/* Custom controls overlay */}
+      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-2 pb-1.5 pt-4">
+        {/* Seek bar */}
+        <div
+          ref={trackRef}
+          className="group h-3 flex items-center cursor-pointer mb-1"
+          onMouseDown={onTrackDown}
+        >
+          <div className="w-full h-1 group-hover:h-1.5 bg-white/20 rounded-full relative transition-all">
+            <div
+              className="absolute top-0 left-0 h-full bg-maize rounded-full"
+              style={{ width: `${pct}%` }}
+            />
+            <div
+              className={`absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 bg-maize rounded-full shadow transition-opacity ${
+                dragging ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+              }`}
+              style={{ left: `${pct}%`, marginLeft: '-5px' }}
+            />
+          </div>
+        </div>
+
+        {/* Play + time */}
+        <div className="flex items-center gap-2 text-[11px] text-white/80 font-mono tabular-nums">
+          <button
+            type="button"
+            onClick={togglePlay}
+            className="hover:text-white text-sm leading-none"
+          >
+            {playing ? '❚❚' : '▶'}
+          </button>
+          <span>
+            {fmtTime(sceneStart + currentTime)} / {fmtTime(sceneEnd)}
+          </span>
+          <span className="text-white/40 ml-auto">
+            {currentTime.toFixed(1)}s / {sceneDuration.toFixed(1)}s
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main component ──────────────────────────────────────────────────────
 
 export function Ingest() {
@@ -139,6 +287,10 @@ export function Ingest() {
     null,
   )
   const [merging, setMerging] = useState(false)
+  const [editingSceneId, setEditingSceneId] = useState<string | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const [durationMin, setDurationMin] = useState('')
+  const [durationMax, setDurationMax] = useState('')
 
   const isRunning = status?.status === 'running'
   const previewScene = result?.scenes.find(
@@ -148,6 +300,22 @@ export function Ingest() {
 
   const pendingMergeCount =
     result?.merge_groups?.filter((g) => g.status === 'pending').length ?? 0
+
+  // Duration filter
+  const durationMinNum = durationMin === '' ? null : parseFloat(durationMin)
+  const durationMaxNum = durationMax === '' ? null : parseFloat(durationMax)
+  const hasDurationFilter =
+    (durationMinNum !== null && !isNaN(durationMinNum)) ||
+    (durationMaxNum !== null && !isNaN(durationMaxNum))
+
+  const filteredScenes = result?.scenes.filter((scene) => {
+    const dur = scene.duration ?? scene.end - scene.start
+    if (durationMinNum !== null && !isNaN(durationMinNum) && dur < durationMinNum)
+      return false
+    if (durationMaxNum !== null && !isNaN(durationMaxNum) && dur > durationMaxNum)
+      return false
+    return true
+  })
 
   // ── Selection & merge logic ───────────────────────────────────────────
 
@@ -266,6 +434,80 @@ export function Ingest() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: 'Apply failed' }))
         throw new Error(err.detail || 'Apply failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // ── Inline rename ─────────────────────────────────────────────────────
+
+  const startEditing = (sceneId: string) => {
+    setEditingSceneId(sceneId)
+    setEditingName(sceneId)
+  }
+
+  const commitRename = async () => {
+    if (!result || !editingSceneId) return
+    const newId = editingName.trim()
+    if (!newId || newId === editingSceneId) {
+      setEditingSceneId(null)
+      return
+    }
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/scenes/rename`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ old_id: editingSceneId, new_id: newId }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Rename failed' }))
+        throw new Error(err.detail || 'Rename failed')
+      }
+      const updated = await res.json()
+      setResult(updated)
+      // Update preview if we renamed the previewed scene
+      if (previewSceneId === editingSceneId) setPreviewSceneId(newId)
+      // Update selection
+      if (selectedScenes.has(editingSceneId)) {
+        setSelectedScenes((prev) => {
+          const next = new Set(prev)
+          next.delete(editingSceneId!)
+          next.add(newId)
+          return next
+        })
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setEditingSceneId(null)
+    }
+  }
+
+  const cancelEditing = () => setEditingSceneId(null)
+
+  // ── Keyframe deletion ────────────────────────────────────────────────
+
+  const deleteKeyframe = async (sceneId: string, kfPath: string) => {
+    if (!result) return
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/scenes/delete-keyframe`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scene_id: sceneId, keyframe_path: kfPath }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Delete failed' }))
+        throw new Error(err.detail || 'Delete failed')
       }
       setResult(await res.json())
     } catch (e) {
@@ -629,12 +871,56 @@ export function Ingest() {
         <p className="text-xs text-coral break-words mb-3 shrink-0">{error}</p>
       )}
 
+      {/* Filter bar */}
+      <div className="shrink-0 mb-3 flex items-center gap-3 flex-wrap">
+        <span className="text-xs text-text-muted">Duration:</span>
+        <div className="flex items-center gap-1.5">
+          <input
+            type="number"
+            value={durationMin}
+            onChange={(e) => setDurationMin(e.target.value)}
+            placeholder="min"
+            min={0}
+            step={1}
+            className="w-16 bg-bg3 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono tabular-nums placeholder:text-text-dim/50 focus:border-maize/50 focus:outline-none"
+          />
+          <span className="text-text-dim text-xs">–</span>
+          <input
+            type="number"
+            value={durationMax}
+            onChange={(e) => setDurationMax(e.target.value)}
+            placeholder="max"
+            min={0}
+            step={1}
+            className="w-16 bg-bg3 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono tabular-nums placeholder:text-text-dim/50 focus:border-maize/50 focus:outline-none"
+          />
+          <span className="text-xs text-text-dim">sec</span>
+        </div>
+        {hasDurationFilter && (
+          <>
+            <span className="text-xs text-maize tabular-nums">
+              {filteredScenes?.length ?? 0} / {result.scenes.length} scenes
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setDurationMin('')
+                setDurationMax('')
+              }}
+              className="text-xs text-text-dim hover:text-text-primary"
+            >
+              Clear
+            </button>
+          </>
+        )}
+      </div>
+
       {/* Two-column layout */}
       <div className="flex gap-4 flex-1 min-h-0">
         {/* Left: Scene list */}
         <div className="flex flex-col w-[55%] min-w-0">
           <div className="flex-1 overflow-y-auto space-y-1 pr-1">
-            {result.scenes.map((scene) => {
+            {(filteredScenes ?? result.scenes).map((scene) => {
               const isSelected = selectedScenes.has(scene.scene_id)
               const isPreviewing = previewSceneId === scene.scene_id
               const isMerged = (scene.merged_from?.length ?? 0) > 0
@@ -681,9 +967,32 @@ export function Ingest() {
 
                   {/* Scene info */}
                   <div className="flex-1 min-w-0 flex items-center gap-2">
-                    <span className="font-mono text-text-primary truncate">
-                      {scene.scene_id}
-                    </span>
+                    {editingSceneId === scene.scene_id ? (
+                      <input
+                        type="text"
+                        value={editingName}
+                        onChange={(e) => setEditingName(e.target.value)}
+                        onBlur={commitRename}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') commitRename()
+                          if (e.key === 'Escape') cancelEditing()
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        autoFocus
+                        className="font-mono text-text-primary bg-bg3 border border-maize/50 rounded px-1.5 py-0.5 text-xs min-w-0 flex-1 focus:outline-none"
+                      />
+                    ) : (
+                      <span
+                        className="font-mono text-text-primary truncate"
+                        onDoubleClick={(e) => {
+                          e.stopPropagation()
+                          startEditing(scene.scene_id)
+                        }}
+                        title="Double-click to rename"
+                      >
+                        {scene.scene_id}
+                      </span>
+                    )}
                     {isMerged && (
                       <span
                         className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
@@ -780,12 +1089,11 @@ export function Ingest() {
             <div className="flex-1 overflow-y-auto space-y-4 bg-bg3/50 rounded-lg p-4 border border-white/5">
               {/* Video player */}
               {videoUrl ? (
-                <video
+                <ScenePlayer
                   key={`${previewScene.scene_id}-${previewScene.start}-${previewScene.end}`}
-                  src={`${videoUrl}#t=${previewScene.start.toFixed(3)},${previewScene.end.toFixed(3)}`}
-                  controls
-                  preload="metadata"
-                  className="w-full rounded border border-white/10 bg-black"
+                  src={videoUrl}
+                  sceneStart={previewScene.start}
+                  sceneEnd={previewScene.end}
                 />
               ) : (
                 <div className="w-full aspect-video rounded border border-white/10 bg-black flex items-center justify-center">
@@ -821,14 +1129,28 @@ export function Ingest() {
                   {previewScene.keyframes.map((kf) => (
                     <figure
                       key={kf.path}
-                      className="flex flex-col items-center gap-1"
+                      className="relative flex flex-col items-center gap-1 group/kf"
                     >
-                      <img
-                        src={keyframeUrl(result.video_id, kf)}
-                        alt={`${previewScene.scene_id} ${kf.role ?? kf.index}`}
-                        loading="lazy"
-                        className="w-full rounded border border-white/10 bg-black"
-                      />
+                      <div className="relative w-full">
+                        <img
+                          src={keyframeUrl(result.video_id, kf)}
+                          alt={`${previewScene.scene_id} ${kf.role ?? kf.index}`}
+                          loading="lazy"
+                          className="w-full rounded border border-white/10 bg-black"
+                        />
+                        {previewScene.keyframes.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              deleteKeyframe(previewScene.scene_id, kf.path)
+                            }
+                            className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-text-dim hover:bg-coral hover:text-white flex items-center justify-center text-xs leading-none opacity-0 group-hover/kf:opacity-100 transition-opacity"
+                            title="Remove keyframe"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
                       <figcaption className="text-[10px] text-text-dim font-mono">
                         {kf.role ?? `frame ${kf.index}`} ·{' '}
                         {fmtTime(kf.timestamp)}

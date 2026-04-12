@@ -25,7 +25,9 @@ from pipeline.video.ingest import (
     list_source_videos,
     load_ingest_result,
     load_merges,
+    delete_keyframe,
     merge_scenes,
+    rename_scene,
     resolve_source_path,
     run_ingest,
     unmerge_group,
@@ -277,6 +279,40 @@ async def apply_merges_endpoint(video_id: str):
         raise HTTPException(400, str(e))
     # After apply, merges.json groups is empty, so _merged_scenes_response
     # returns scenes.json verbatim — which is now the baked merged view.
+    return _merged_scenes_response(video_id)
+
+
+class RenameRequest(BaseModel):
+    old_id: str
+    new_id: str
+
+
+class DeleteKeyframeRequest(BaseModel):
+    scene_id: str
+    keyframe_path: str
+
+
+@router.post("/videos/{video_id}/scenes/delete-keyframe")
+async def delete_keyframe_endpoint(video_id: str, req: DeleteKeyframeRequest):
+    """Remove a keyframe from a scene."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        delete_keyframe(video_id, req.scene_id, req.keyframe_path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.patch("/videos/{video_id}/scenes/rename")
+async def rename_scene_endpoint(video_id: str, req: RenameRequest):
+    """Rename a scene (raw or merged). Updates scenes.json and merges.json."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        rename_scene(video_id, req.old_id, req.new_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)
 
 

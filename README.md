@@ -58,25 +58,47 @@ Real, working end-to-end. Drop a video into `public/data/source/videos/`, pick i
 - `detect_scene_boundaries()` — PySceneDetect `ContentDetector` (default threshold 27.0)
 - `extract_keyframe()` — `ffmpeg` fast-seek single-frame JPEG extraction
 - `_keyframe_timestamps()` — start/mid/end (with 0.25s edge inset) for scenes ≥3s, midpoint only for shorter scenes
-- Writes `data/runs/video/<video_id>/scenes.json` + `metadata.json` and `keyframes/scene_NNN_{start,mid,end}.jpg`
+- `extract_audio()` — `ffmpeg` 16 kHz mono PCM WAV extraction for downstream transcription
+- Writes `data/runs/video/<video_id>/scenes.json` + `scenes.raw.json` + `metadata.json` + `audio.wav` and `keyframes/scene_NNN_{start,mid,end}.jpg`
+- `scenes.raw.json` is the pristine PySceneDetect output, written at ingest time. `scenes.json` may later be modified by merge-apply; `.raw.json` never changes after creation.
 - `source_public_path` field is persisted so the frontend can serve the original video directly through Vite for clip preview
+
+**Scene merging** (`pipeline/video/ingest.py` merge subsystem)
+
+Users can consolidate adjacent scenes from the UI. The system uses a two-phase commit model with a `merges.json` sidecar:
+
+1. **Pending merges** — freely reversible per-group via `DELETE /merges/{group_id}`
+2. **Apply all merges** — bakes the merged view into `scenes.json`, clears the sidecar. Irreversible from the UI (re-run Stage 1 to reset). `scenes.raw.json` stays untouched as the pristine baseline.
+
+Key design points:
+- `merges.json` sidecar tracks groups, their member scene IDs, and status (`pending` | `committed`)
+- Group absorption: merging a pending group with adjacent scenes creates a larger group
+- Committed groups are frozen — cannot be absorbed or unmerged
+- Contiguity validation: only adjacent scenes in the raw scene list can be merged
+- v1→v2 migration: old sidecars without status fields default to "committed"
 
 **Backend HTTP** (`pipeline/video/router.py`, mounted at `/api/video`)
 - `GET /source-videos` — list videos in `public/data/source/videos/`
 - `GET /videos` — list ingested runs
 - `POST /ingest` — kick off Stage 1 in a background thread, returns `video_id`
 - `GET /ingest/{video_id}/status` — poll phase / progress (`probing` → `detecting` → `extracting` → `completed`)
-- `GET /videos/{video_id}/scenes` — full `scenes.json` payload
+- `GET /videos/{video_id}/scenes` — merged scene view (applies `merges.json` groups); pass `?raw=true` for untouched PySceneDetect output
+- `POST /videos/{video_id}/merges` — create a pending merge group from contiguous scene IDs
+- `DELETE /videos/{video_id}/merges/{group_id}` — unmerge a pending group (409 for committed)
+- `POST /videos/{video_id}/merges/apply` — bake all merges into `scenes.json` (irreversible)
 - `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
 
 **Frontend** (`src/views/VideoPipeline/Ingest/index.tsx`)
-- Source video dropdown driven by `/api/video/source-videos`
-- Optional video ID override (auto-derived from filename otherwise)
-- Live progress: phase label, spinner, and a keyframe progress bar during extraction (1s polling)
-- Ingested-videos list with click-to-load
-- Per-scene expandable rows showing:
-  - Inline HTML5 `<video>` clip preview using a Media Fragment URI (`#t=start,end`) — playback is constrained to the scene range, no actual cutting required
-  - Thumbnail strip of the start / mid / end keyframes
+
+Two-level master-detail navigation:
+
+- **Level 1 — Video list**: Run Ingest form + Ingested Videos list. Click a video to drill in.
+- **Level 2 — Scene browser**: Side-by-side layout with back navigation.
+  - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID, merge status badge, time range, duration, and ✕ unmerge button. Merge action bar at bottom.
+  - **Right panel (45%)**: Video player (time-bounded to selected scene via Media Fragment URI), scene metadata, and 3-column keyframe grid.
+  - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
+  - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
+  - "Apply All Merges" button appears when pending merges exist
 
 ### Stages 2–5 (planned)
 
@@ -95,9 +117,10 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 |---|---|
 | Sidebar restructure (collapsible Classifier + Video Pipeline groups, Model Compare leaf) | Done |
 | Backend sub-package layout (`pipeline/video/`) wired into existing FastAPI app | Done |
-| Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg | Done |
-| Stage 1 ingest — audio track extraction (`audio.wav`, 16 kHz mono PCM) | Done |
-| Stage 1 frontend — run, poll, preview keyframes, preview scene clips | Done |
+| Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
+| Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
+| Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json` | Done |
+| Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, video preview, keyframe grid) | Done |
 | Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
 | Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
 | Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |

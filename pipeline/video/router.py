@@ -18,12 +18,17 @@ from pydantic import BaseModel
 
 from pipeline.video.ingest import (
     VIDEO_RUNS_DIR,
+    apply_all_merges,
+    apply_merges,
     derive_video_id,
     list_ingested_videos,
     list_source_videos,
     load_ingest_result,
+    load_merges,
+    merge_scenes,
     resolve_source_path,
     run_ingest,
+    unmerge_group,
 )
 from pipeline.video.transcribe import (
     DEFAULT_MODEL as WHISPER_DEFAULT_MODEL,
@@ -63,6 +68,10 @@ class IngestRequest(BaseModel):
     source_path: str
     video_id: str | None = None
     threshold: float = 27.0
+
+
+class MergeRequest(BaseModel):
+    scene_ids: list[str]
 
 
 class TranscribeRequest(BaseModel):
@@ -181,12 +190,94 @@ async def get_ingest_status(video_id: str):
     }
 
 
-@router.get("/videos/{video_id}/scenes")
-async def get_scenes(video_id: str):
+def _merged_scenes_response(video_id: str) -> dict:
+    """Build the merged-view payload (raw scenes + applied merges)."""
     result = load_ingest_result(video_id)
     if result is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
-    return result
+    merges = load_merges(video_id)
+    merged_scenes = apply_merges(result["scenes"], merges)
+    return {
+        **result,
+        "scenes": merged_scenes,
+        "scene_count": len(merged_scenes),
+        "raw_scene_count": result["scene_count"],
+        "merge_groups": merges["groups"],
+    }
+
+
+@router.get("/videos/{video_id}/scenes")
+async def get_scenes(video_id: str, raw: bool = False):
+    """Return scenes for a video.
+
+    By default, any user-created merge groups (from `merges.json`) are
+    folded into the scene list — adjacent raw scenes belonging to a group
+    collapse into a single merged scene whose `scene_id` is the group ID
+    and whose keyframes are the union of the members'. Pass `?raw=true`
+    to bypass this and get the untouched PySceneDetect output.
+    """
+    if raw:
+        result = load_ingest_result(video_id)
+        if result is None:
+            raise HTTPException(404, f"No ingest output for {video_id}")
+        return result
+    return _merged_scenes_response(video_id)
+
+
+@router.post("/videos/{video_id}/merges")
+async def create_merge(video_id: str, req: MergeRequest):
+    """Merge a contiguous run of scenes into a pending group.
+
+    Accepts a mix of raw scene IDs and existing *pending* group IDs. The
+    combined set must be contiguous in the raw scene list. Pending groups
+    touched by the merge are absorbed into the new larger group. Committed
+    groups are frozen — attempting to merge into one returns 400. New
+    groups always start with status="pending"; call POST
+    /videos/{video_id}/merges/apply to commit them.
+    """
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        merge_scenes(video_id, req.scene_ids)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.delete("/videos/{video_id}/merges/{group_id}")
+async def delete_merge(video_id: str, group_id: str):
+    """Unmerge a pending group. Committed groups cannot be unmerged."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        unmerge_group(video_id, group_id)
+    except ValueError as e:
+        # "committed and cannot be unmerged" is semantically a conflict,
+        # "unknown group_id" is a 404. Cheap sniff on the message.
+        if "committed" in str(e):
+            raise HTTPException(409, str(e))
+        raise HTTPException(404, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.post("/videos/{video_id}/merges/apply")
+async def apply_merges_endpoint(video_id: str):
+    """Bake all merge groups into scenes.json. Irreversible from the UI —
+    the only way to undo afterwards is to re-run Stage 1.
+
+    After this call, scenes.json is the canonical scene list. The
+    merges.json sidecar is cleared. Downstream stages can read
+    scenes.json directly without any merge-folding logic.
+    """
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        apply_all_merges(video_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # After apply, merges.json groups is empty, so _merged_scenes_response
+    # returns scenes.json verbatim — which is now the baked merged view.
+    return _merged_scenes_response(video_id)
 
 
 @router.post("/transcribe")

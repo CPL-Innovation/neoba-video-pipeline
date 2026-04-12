@@ -3,6 +3,8 @@ import { PageHeader } from '../../../components/PageHeader'
 import { Card } from '../../../components/Card'
 import { Button } from '../../../components/Button'
 
+// ── Types ───────────────────────────────────────────────────────────────
+
 interface Keyframe {
   index: number
   timestamp: number
@@ -16,6 +18,16 @@ interface Scene {
   end: number
   duration?: number
   keyframes: Keyframe[]
+  merged_from?: string[]
+  merge_status?: 'pending' | 'committed'
+}
+
+interface MergeGroup {
+  group_id: string
+  scene_ids: string[]
+  status: 'pending' | 'committed'
+  created_at: string
+  committed_at?: string
 }
 
 interface IngestResult {
@@ -28,6 +40,8 @@ interface IngestResult {
   status: string
   created_at: string
   detector?: { name: string; threshold: number }
+  raw_scene_count?: number
+  merge_groups?: MergeGroup[]
 }
 
 interface VideoSummary {
@@ -72,6 +86,8 @@ const PHASE_LABEL: Record<IngestStatus['phase'], string> = {
   failed: 'Failed',
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────
+
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
@@ -85,49 +101,179 @@ function fmtTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-/**
- * Derive a Vite-served URL for the source video.
- *
- * Vite serves anything under `public/` at the root, so a file at
- * `public/data/source/videos/foo.mp4` is reachable at
- * `/data/source/videos/foo.mp4`. We prefer the explicit
- * `source_public_path` field (relative to public/), and fall back to
- * parsing the absolute `source_path` for older ingest runs that
- * predate that field.
- */
 function deriveVideoUrl(result: IngestResult): string | null {
   if (result.source_public_path) {
     return '/' + result.source_public_path.replace(/^\/+/, '')
   }
-  // Fallback: find /public/ in the absolute source_path
   const marker = '/public/'
   const idx = result.source_path.lastIndexOf(marker)
   if (idx === -1) return null
   return '/' + result.source_path.slice(idx + marker.length)
 }
 
+function keyframeUrl(videoId: string, kf: Keyframe): string {
+  const filename = kf.path.split('/').pop() ?? ''
+  return `/api/video/videos/${videoId}/keyframes/${filename}`
+}
+
+// ── Main component ──────────────────────────────────────────────────────
+
 export function Ingest() {
+  // Level navigation: 'list' = video hub, 'scenes' = scene browser
+  const [view, setView] = useState<'list' | 'scenes'>('list')
+
+  // Level 1 state
   const [sourceVideos, setSourceVideos] = useState<SourceVideo[]>([])
   const [sourcePath, setSourcePath] = useState('')
   const [videoId, setVideoId] = useState('')
-  const [activeVideoId, setActiveVideoId] = useState<string | null>(null)
   const [status, setStatus] = useState<IngestStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [result, setResult] = useState<IngestResult | null>(null)
   const [videos, setVideos] = useState<VideoSummary[]>([])
-  const [expandedScenes, setExpandedScenes] = useState<Set<string>>(new Set())
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const toggleScene = (sceneId: string) => {
-    setExpandedScenes((prev) => {
-      const next = new Set(prev)
-      if (next.has(sceneId)) next.delete(sceneId)
-      else next.add(sceneId)
-      return next
-    })
-  }
+  // Level 2 state
+  const [result, setResult] = useState<IngestResult | null>(null)
+  const [previewSceneId, setPreviewSceneId] = useState<string | null>(null)
+  const [selectedScenes, setSelectedScenes] = useState<Set<string>>(new Set())
+  const [lastClickedSceneId, setLastClickedSceneId] = useState<string | null>(
+    null,
+  )
+  const [merging, setMerging] = useState(false)
 
   const isRunning = status?.status === 'running'
+  const previewScene = result?.scenes.find(
+    (s) => s.scene_id === previewSceneId,
+  )
+  const videoUrl = result ? deriveVideoUrl(result) : null
+
+  const pendingMergeCount =
+    result?.merge_groups?.filter((g) => g.status === 'pending').length ?? 0
+
+  // ── Selection & merge logic ───────────────────────────────────────────
+
+  const handleSelectScene = (sceneId: string, shiftKey: boolean) => {
+    if (!result) return
+    const ids = result.scenes.map((s) => s.scene_id)
+    if (shiftKey && lastClickedSceneId) {
+      const a = ids.indexOf(lastClickedSceneId)
+      const b = ids.indexOf(sceneId)
+      if (a === -1 || b === -1) return
+      const [lo, hi] = a < b ? [a, b] : [b, a]
+      const rangeIds = ids.slice(lo, hi + 1)
+      const adding = !selectedScenes.has(sceneId)
+      setSelectedScenes((prev) => {
+        const next = new Set(prev)
+        for (const id of rangeIds) {
+          if (adding) next.add(id)
+          else next.delete(id)
+        }
+        return next
+      })
+    } else {
+      setSelectedScenes((prev) => {
+        const next = new Set(prev)
+        if (next.has(sceneId)) next.delete(sceneId)
+        else next.add(sceneId)
+        return next
+      })
+    }
+    setLastClickedSceneId(sceneId)
+  }
+
+  const clearSelection = () => {
+    setSelectedScenes(new Set())
+    setLastClickedSceneId(null)
+  }
+
+  const selectionInfo = (() => {
+    if (!result || selectedScenes.size === 0) return null
+    const ids = result.scenes.map((s) => s.scene_id)
+    const positions = ids
+      .map((id, i) => (selectedScenes.has(id) ? i : -1))
+      .filter((i) => i !== -1)
+      .sort((a, b) => a - b)
+    if (positions.length === 0) return null
+    const first = result.scenes[positions[0]]
+    const last = result.scenes[positions[positions.length - 1]]
+    const contiguous =
+      positions[positions.length - 1] - positions[0] === positions.length - 1
+    return {
+      count: positions.length,
+      contiguous,
+      start: first.start,
+      end: last.end,
+      orderedIds: positions.map((i) => ids[i]),
+    }
+  })()
+
+  const mergeSelected = async () => {
+    if (!result || !selectionInfo || !selectionInfo.contiguous) return
+    setMerging(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/video/videos/${result.video_id}/merges`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene_ids: selectionInfo.orderedIds }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Merge failed' }))
+        throw new Error(err.detail || 'Merge failed')
+      }
+      setResult(await res.json())
+      clearSelection()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMerging(false)
+    }
+  }
+
+  const unmergeGroup = async (groupId: string) => {
+    if (!result) return
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/merges/${groupId}`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) {
+        const err = await res
+          .json()
+          .catch(() => ({ detail: 'Unmerge failed' }))
+        throw new Error(err.detail || 'Unmerge failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const applyAllMerges = async () => {
+    if (!result || pendingMergeCount === 0) return
+    const ok = window.confirm(
+      `Apply ${pendingMergeCount} pending merge${
+        pendingMergeCount === 1 ? '' : 's'
+      }?\n\nThis bakes merged scenes into scenes.json. Re-run scene detection to undo.`,
+    )
+    if (!ok) return
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/merges/apply`,
+        { method: 'POST' },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Apply failed' }))
+        throw new Error(err.detail || 'Apply failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // ── Data fetching ─────────────────────────────────────────────────────
 
   const refreshVideos = async () => {
     try {
@@ -155,9 +301,11 @@ export function Ingest() {
         setStatus(data)
         if (data.status === 'completed') {
           stopPolling()
-          // Pull the full scenes.json now that it's on disk
           const scenesRes = await fetch(`/api/video/videos/${vid}/scenes`)
-          if (scenesRes.ok) setResult(await scenesRes.json())
+          if (scenesRes.ok) {
+            setResult(await scenesRes.json())
+            setView('scenes')
+          }
           refreshVideos()
         } else if (data.status === 'failed') {
           stopPolling()
@@ -179,7 +327,6 @@ export function Ingest() {
         if (list.length > 0) setSourcePath(list[0].relative_path)
       })
       .catch(() => setSourceVideos([]))
-
     return () => stopPolling()
   }, [])
 
@@ -201,11 +348,12 @@ export function Ingest() {
         }),
       })
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Unknown error' }))
+        const err = await res
+          .json()
+          .catch(() => ({ detail: 'Unknown error' }))
         throw new Error(err.detail || 'Ingest failed')
       }
       const { video_id: vid } = await res.json()
-      setActiveVideoId(vid)
       startPolling(vid)
     } catch (e) {
       setStatus(null)
@@ -213,19 +361,35 @@ export function Ingest() {
     }
   }
 
-  const loadVideo = async (id: string) => {
+  const openVideo = async (id: string) => {
     setError(null)
-    setActiveVideoId(id)
     setStatus(null)
-    setExpandedScenes(new Set())
+    setPreviewSceneId(null)
+    clearSelection()
     try {
       const res = await fetch(`/api/video/videos/${id}/scenes`)
       if (!res.ok) throw new Error(`Failed to load ${id}`)
-      setResult(await res.json())
+      const data: IngestResult = await res.json()
+      setResult(data)
+      setView('scenes')
+      // Auto-preview the first scene
+      if (data.scenes.length > 0) {
+        setPreviewSceneId(data.scenes[0].scene_id)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
+
+  const goBack = () => {
+    setView('list')
+    setResult(null)
+    setPreviewSceneId(null)
+    clearSelection()
+    setError(null)
+  }
+
+  // ── Render: progress bar ──────────────────────────────────────────────
 
   const renderProgress = () => {
     if (!status) return null
@@ -273,237 +437,416 @@ export function Ingest() {
     )
   }
 
-  return (
-    <div>
-      <PageHeader
-        title="Ingest & Segment"
-        description="Stage 1 — probe duration (ffprobe), detect scene boundaries (PySceneDetect ContentDetector), extract start/mid/end keyframes per scene (ffmpeg)."
-      />
+  // ── Render: Level 1 — Video hub ───────────────────────────────────────
 
-      <div className="grid gap-5 lg:grid-cols-2">
-        <Card>
-          <h3 className="text-sm font-medium text-text-primary mb-4">Run Ingest</h3>
-          <div className="space-y-4">
-            <div>
-              <label className="block text-xs text-text-muted mb-1">
-                Source Video{' '}
-                <span className="text-text-dim">
-                  (public/data/source/videos/)
-                </span>
-              </label>
-              {sourceVideos.length > 0 ? (
-                <select
-                  value={sourcePath}
-                  onChange={(e) => setSourcePath(e.target.value)}
-                  disabled={isRunning}
-                  className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
-                >
-                  {sourceVideos.map((v) => (
-                    <option key={v.relative_path} value={v.relative_path}>
-                      {v.name} ({fmtBytes(v.size_bytes)})
-                    </option>
-                  ))}
-                </select>
-              ) : (
+  if (view === 'list') {
+    return (
+      <div>
+        <PageHeader
+          title="Ingest & Segment"
+          description="Stage 1 — probe duration (ffprobe), detect scene boundaries (PySceneDetect ContentDetector), extract start/mid/end keyframes per scene (ffmpeg)."
+        />
+
+        <div className="grid gap-5 lg:grid-cols-2">
+          <Card>
+            <h3 className="text-sm font-medium text-text-primary mb-4">
+              Run Ingest
+            </h3>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs text-text-muted mb-1">
+                  Source Video{' '}
+                  <span className="text-text-dim">
+                    (public/data/source/videos/)
+                  </span>
+                </label>
+                {sourceVideos.length > 0 ? (
+                  <select
+                    value={sourcePath}
+                    onChange={(e) => setSourcePath(e.target.value)}
+                    disabled={isRunning}
+                    className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
+                  >
+                    {sourceVideos.map((v) => (
+                      <option key={v.relative_path} value={v.relative_path}>
+                        {v.name} ({fmtBytes(v.size_bytes)})
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    value={sourcePath}
+                    onChange={(e) => setSourcePath(e.target.value)}
+                    disabled={isRunning}
+                    placeholder="public/data/source/videos/clip.mp4 or absolute path"
+                    className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
+                  />
+                )}
+                {sourceVideos.length === 0 && (
+                  <p className="text-xs text-text-dim mt-1">
+                    No videos found in public/data/source/videos/. Drop one in
+                    or type any path manually.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs text-text-muted mb-1">
+                  Video ID (optional — derived from filename if blank)
+                </label>
                 <input
                   type="text"
-                  value={sourcePath}
-                  onChange={(e) => setSourcePath(e.target.value)}
+                  value={videoId}
+                  onChange={(e) => setVideoId(e.target.value)}
                   disabled={isRunning}
-                  placeholder="public/data/source/videos/clip.mp4 or absolute path"
+                  placeholder="neoba_1978_03_14_news"
                   className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
                 />
-              )}
-              {sourceVideos.length === 0 && (
-                <p className="text-xs text-text-dim mt-1">
-                  No videos found in public/data/source/videos/. Drop one in or
-                  type any path manually.
-                </p>
-              )}
-            </div>
+              </div>
 
-            <div>
-              <label className="block text-xs text-text-muted mb-1">
-                Video ID (optional — derived from filename if blank)
-              </label>
-              <input
-                type="text"
-                value={videoId}
-                onChange={(e) => setVideoId(e.target.value)}
+              <Button
+                onClick={runIngest}
                 disabled={isRunning}
-                placeholder="neoba_1978_03_14_news"
-                className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
-              />
+                size="lg"
+                className="w-full"
+              >
+                {isRunning ? 'Ingesting…' : 'Run Ingest'}
+              </Button>
+
+              {error && (
+                <p className="text-xs text-coral break-words">{error}</p>
+              )}
+
+              {renderProgress()}
             </div>
+          </Card>
 
-            <Button onClick={runIngest} disabled={isRunning} size="lg" className="w-full">
-              {isRunning ? 'Ingesting…' : 'Run Ingest'}
-            </Button>
-
-            {error && (
-              <p className="text-xs text-coral break-words">{error}</p>
+          <Card>
+            <h3 className="text-sm font-medium text-text-primary mb-4">
+              Ingested Videos
+            </h3>
+            {videos.length === 0 ? (
+              <p className="text-sm text-text-dim">
+                Nothing ingested yet. Run Stage 1 above to create the first
+                entry.
+              </p>
+            ) : (
+              <ul className="space-y-1">
+                {videos.map((v) => (
+                  <li key={v.video_id}>
+                    <button
+                      type="button"
+                      onClick={() => openVideo(v.video_id)}
+                      className="w-full flex items-center justify-between gap-3 px-3 py-2 rounded-md text-sm hover:bg-white/5 transition-colors group"
+                    >
+                      <span className="font-mono text-xs text-text-primary group-hover:text-maize truncate">
+                        {v.video_id}
+                      </span>
+                      <span className="text-xs text-text-dim shrink-0 flex items-center gap-2">
+                        {v.scene_count ?? '—'} scenes ·{' '}
+                        <span
+                          className={
+                            v.status === 'completed'
+                              ? 'text-teal'
+                              : 'text-text-dim'
+                          }
+                        >
+                          {v.status ?? 'unknown'}
+                        </span>
+                        <span className="text-text-dim opacity-0 group-hover:opacity-100 transition-opacity">
+                          →
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
+          </Card>
+        </div>
+      </div>
+    )
+  }
 
-            {renderProgress()}
-          </div>
-        </Card>
+  // ── Render: Level 2 — Scene browser ───────────────────────────────────
 
-        <Card>
-          <h3 className="text-sm font-medium text-text-primary mb-4">
-            Ingested Videos
-          </h3>
-          {videos.length === 0 ? (
-            <p className="text-sm text-text-dim">
-              Nothing ingested yet. Run Stage 1 above to create the first entry.
-            </p>
-          ) : (
-            <ul className="space-y-2">
-              {videos.map((v) => (
-                <li
-                  key={v.video_id}
-                  className="flex items-center justify-between gap-3 text-sm"
-                >
-                  <button
-                    type="button"
-                    onClick={() => loadVideo(v.video_id)}
-                    className={`text-left font-mono text-xs truncate ${
-                      activeVideoId === v.video_id
-                        ? 'text-maize'
-                        : 'text-text-primary hover:text-maize'
-                    }`}
-                    title={v.source_path}
-                  >
-                    {v.video_id}
-                  </button>
-                  <span className="text-xs text-text-dim shrink-0">
-                    {v.scene_count ?? '—'} scenes · {v.status ?? 'unknown'}
+  if (!result) return null
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-2rem)]">
+      {/* Header bar */}
+      <div className="flex items-center justify-between gap-4 mb-4 shrink-0">
+        <div className="flex items-center gap-3 min-w-0">
+          <button
+            type="button"
+            onClick={goBack}
+            className="text-text-muted hover:text-text-primary text-sm shrink-0"
+            title="Back to video list"
+          >
+            ← Back
+          </button>
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium text-text-primary truncate">
+              {result.video_id}
+            </h2>
+            <p className="text-xs text-text-dim mt-0.5">
+              {result.scene_count} scenes
+              {result.raw_scene_count != null &&
+                result.raw_scene_count !== result.scene_count && (
+                  <span>
+                    {' '}
+                    (from {result.raw_scene_count} raw)
                   </span>
-                </li>
-              ))}
-            </ul>
+                )}
+              {pendingMergeCount > 0 && (
+                <span className="text-maize">
+                  {' · '}
+                  {pendingMergeCount} pending
+                </span>
+              )}
+              {' · '}{fmtTime(result.duration)}
+              {result.detector && (
+                <>
+                  {' · '}
+                  {result.detector.name} ({result.detector.threshold})
+                </>
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {pendingMergeCount > 0 && (
+            <Button onClick={applyAllMerges} variant="secondary" size="sm">
+              Apply {pendingMergeCount} merge
+              {pendingMergeCount === 1 ? '' : 's'}
+            </Button>
           )}
-        </Card>
+        </div>
       </div>
 
-      {result && (
-        <div className="mt-5">
-          <Card>
-            <div className="flex items-start justify-between mb-4">
-              <div>
-                <h3 className="text-sm font-medium text-text-primary">
-                  {result.video_id}
-                </h3>
-                <p className="text-xs text-text-dim font-mono mt-1 break-all">
-                  {result.source_path}
-                </p>
-                <p className="text-xs text-text-dim mt-1">
-                  {result.scene_count} scenes · duration {fmtTime(result.duration)} ·{' '}
-                  status{' '}
-                  <span
-                    className={
-                      result.status === 'completed' ? 'text-teal' : 'text-amber'
-                    }
-                  >
-                    {result.status}
+      {error && (
+        <p className="text-xs text-coral break-words mb-3 shrink-0">{error}</p>
+      )}
+
+      {/* Two-column layout */}
+      <div className="flex gap-4 flex-1 min-h-0">
+        {/* Left: Scene list */}
+        <div className="flex flex-col w-[55%] min-w-0">
+          <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+            {result.scenes.map((scene) => {
+              const isSelected = selectedScenes.has(scene.scene_id)
+              const isPreviewing = previewSceneId === scene.scene_id
+              const isMerged = (scene.merged_from?.length ?? 0) > 0
+              const isPending = isMerged && scene.merge_status === 'pending'
+              const isCommitted = isMerged && scene.merge_status !== 'pending'
+              const firstKf = scene.keyframes[0]
+
+              return (
+                <div
+                  key={scene.scene_id}
+                  className={`flex items-center gap-2 px-2 py-1.5 rounded-md text-xs cursor-pointer transition-colors ${
+                    isPreviewing
+                      ? 'bg-white/8 ring-1 ring-maize/40'
+                      : 'hover:bg-white/4'
+                  } ${isSelected ? 'ring-1 ring-maize/60' : ''}`}
+                  onClick={() => setPreviewSceneId(scene.scene_id)}
+                >
+                  {/* Checkbox */}
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={() => {
+                      /* handled by onClick */
+                    }}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleSelectScene(scene.scene_id, e.shiftKey)
+                    }}
+                    className="accent-maize cursor-pointer shrink-0"
+                    title="Select (shift-click for range)"
+                  />
+
+                  {/* Thumbnail */}
+                  {firstKf ? (
+                    <img
+                      src={keyframeUrl(result.video_id, firstKf)}
+                      alt=""
+                      loading="lazy"
+                      className="w-12 h-8 object-cover rounded border border-white/10 bg-black shrink-0"
+                    />
+                  ) : (
+                    <div className="w-12 h-8 rounded border border-white/10 bg-black shrink-0" />
+                  )}
+
+                  {/* Scene info */}
+                  <div className="flex-1 min-w-0 flex items-center gap-2">
+                    <span className="font-mono text-text-primary truncate">
+                      {scene.scene_id}
+                    </span>
+                    {isMerged && (
+                      <span
+                        className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
+                          isCommitted
+                            ? 'bg-teal/15 text-teal'
+                            : 'bg-maize/15 text-maize'
+                        }`}
+                        title={
+                          isCommitted
+                            ? 'Committed — re-run scene detection to reset'
+                            : 'Pending — click ✕ to undo'
+                        }
+                      >
+                        {isCommitted ? 'merged' : 'pending'} ×
+                        {scene.merged_from!.length}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Time + keyframes */}
+                  <span className="text-text-muted shrink-0 tabular-nums">
+                    {fmtTime(scene.start)}→{fmtTime(scene.end)}
                   </span>
-                  {result.detector && (
-                    <>
-                      {' · '}
-                      {result.detector.name} (threshold {result.detector.threshold})
-                    </>
+                  <span className="text-text-dim shrink-0 w-8 text-right tabular-nums">
+                    {scene.duration != null
+                      ? `${scene.duration.toFixed(0)}s`
+                      : ''}
+                  </span>
+
+                  {/* Unmerge button */}
+                  {isPending && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        unmergeGroup(scene.scene_id)
+                      }}
+                      className="shrink-0 text-text-dim hover:text-coral px-1 text-sm leading-none"
+                      title="Unmerge"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Merge action bar — sticky at bottom of scene list */}
+          {selectionInfo && (
+            <div className="shrink-0 mt-2 bg-bg2/95 backdrop-blur border border-white/10 rounded-md px-3 py-2 flex items-center gap-3">
+              <div className="text-xs flex-1 min-w-0">
+                <div className="text-text-primary">
+                  {selectionInfo.count} scene
+                  {selectionInfo.count === 1 ? '' : 's'} selected
+                  <span className="text-text-dim">
+                    {' · '}
+                    {fmtTime(selectionInfo.start)} →{' '}
+                    {fmtTime(selectionInfo.end)}{' '}
+                    ({(selectionInfo.end - selectionInfo.start).toFixed(1)}s)
+                  </span>
+                </div>
+                {!selectionInfo.contiguous && (
+                  <div className="text-coral text-[11px] mt-0.5">
+                    Selection is not contiguous — pick adjacent scenes only.
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={clearSelection}
+                className="text-xs text-text-muted hover:text-text-primary px-2 py-1"
+              >
+                Clear
+              </button>
+              <Button
+                onClick={mergeSelected}
+                disabled={
+                  merging || !selectionInfo.contiguous || selectionInfo.count < 2
+                }
+                size="sm"
+              >
+                {merging
+                  ? 'Merging…'
+                  : `Merge ${selectionInfo.count} scenes`}
+              </Button>
+            </div>
+          )}
+        </div>
+
+        {/* Right: Preview panel */}
+        <div className="w-[45%] shrink-0 flex flex-col min-h-0">
+          {previewScene ? (
+            <div className="flex-1 overflow-y-auto space-y-4 bg-bg3/50 rounded-lg p-4 border border-white/5">
+              {/* Video player */}
+              {videoUrl ? (
+                <video
+                  key={`${previewScene.scene_id}-${previewScene.start}-${previewScene.end}`}
+                  src={`${videoUrl}#t=${previewScene.start.toFixed(3)},${previewScene.end.toFixed(3)}`}
+                  controls
+                  preload="metadata"
+                  className="w-full rounded border border-white/10 bg-black"
+                />
+              ) : (
+                <div className="w-full aspect-video rounded border border-white/10 bg-black flex items-center justify-center">
+                  <p className="text-[11px] text-text-dim italic">
+                    Source video not under public/ — preview unavailable.
+                  </p>
+                </div>
+              )}
+
+              {/* Scene metadata */}
+              <div className="space-y-1">
+                <h3 className="text-sm font-medium text-text-primary font-mono">
+                  {previewScene.scene_id}
+                </h3>
+                <p className="text-xs text-text-dim">
+                  {fmtTime(previewScene.start)} → {fmtTime(previewScene.end)}
+                  {previewScene.duration != null && (
+                    <span> · {previewScene.duration.toFixed(1)}s</span>
+                  )}
+                  {' · '}{previewScene.keyframes.length} keyframe
+                  {previewScene.keyframes.length === 1 ? '' : 's'}
+                  {previewScene.merged_from && (
+                    <span className="text-teal">
+                      {' · '}merged from {previewScene.merged_from.length} scenes
+                    </span>
                   )}
                 </p>
               </div>
-            </div>
 
-            {(() => {
-              const videoUrl = deriveVideoUrl(result)
-              return (
-            <div className="space-y-2 max-h-[640px] overflow-y-auto pr-1">
-              {result.scenes.map((scene) => {
-                const isExpanded = expandedScenes.has(scene.scene_id)
-                return (
-                  <div
-                    key={scene.scene_id}
-                    className="bg-bg3 rounded-md overflow-hidden"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => toggleScene(scene.scene_id)}
-                      className="w-full flex items-center justify-between gap-4 px-3 py-2 text-xs text-left hover:bg-white/3 transition-colors"
+              {/* Keyframes grid */}
+              {previewScene.keyframes.length > 0 && (
+                <div className="grid grid-cols-3 gap-2">
+                  {previewScene.keyframes.map((kf) => (
+                    <figure
+                      key={kf.path}
+                      className="flex flex-col items-center gap-1"
                     >
-                      <span className="flex items-center gap-2 min-w-0">
-                        <span className="text-text-dim w-3 text-center">
-                          {isExpanded ? '▾' : '▸'}
-                        </span>
-                        <span className="font-mono text-text-primary truncate">
-                          {scene.scene_id}
-                        </span>
-                      </span>
-                      <span className="text-text-muted shrink-0">
-                        {fmtTime(scene.start)} → {fmtTime(scene.end)}
-                        {scene.duration != null && (
-                          <span className="text-text-dim">
-                            {' '}
-                            ({scene.duration.toFixed(1)}s)
-                          </span>
-                        )}
-                      </span>
-                      <span className="text-text-dim shrink-0">
-                        {scene.keyframes.length} keyframe
-                        {scene.keyframes.length === 1 ? '' : 's'}
-                      </span>
-                    </button>
-                    {isExpanded && (
-                      <div className="px-3 pb-3 pt-2 space-y-3 border-t border-white/6">
-                        {videoUrl ? (
-                          <video
-                            key={`${scene.scene_id}-${scene.start}-${scene.end}`}
-                            src={`${videoUrl}#t=${scene.start.toFixed(3)},${scene.end.toFixed(3)}`}
-                            controls
-                            preload="metadata"
-                            className="w-full max-w-md rounded border border-white/10 bg-black"
-                          />
-                        ) : (
-                          <p className="text-[11px] text-text-dim italic">
-                            Source video not under public/ — clip preview unavailable.
-                          </p>
-                        )}
-                        {scene.keyframes.length > 0 && (
-                        <div className="flex gap-3 flex-wrap">
-                        {scene.keyframes.map((kf) => {
-                          const filename = kf.path.split('/').pop() ?? ''
-                          const url = `/api/video/videos/${result.video_id}/keyframes/${filename}`
-                          return (
-                            <figure
-                              key={kf.path}
-                              className="flex flex-col items-center gap-1"
-                            >
-                              <img
-                                src={url}
-                                alt={`${scene.scene_id} ${kf.role ?? kf.index}`}
-                                loading="lazy"
-                                className="h-32 w-auto rounded border border-white/10 bg-black"
-                              />
-                              <figcaption className="text-[10px] text-text-dim font-mono">
-                                {kf.role ?? `frame ${kf.index}`} · {fmtTime(kf.timestamp)}
-                              </figcaption>
-                            </figure>
-                          )
-                        })}
-                        </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
+                      <img
+                        src={keyframeUrl(result.video_id, kf)}
+                        alt={`${previewScene.scene_id} ${kf.role ?? kf.index}`}
+                        loading="lazy"
+                        className="w-full rounded border border-white/10 bg-black"
+                      />
+                      <figcaption className="text-[10px] text-text-dim font-mono">
+                        {kf.role ?? `frame ${kf.index}`} ·{' '}
+                        {fmtTime(kf.timestamp)}
+                      </figcaption>
+                    </figure>
+                  ))}
+                </div>
+              )}
             </div>
-              )
-            })()}
-          </Card>
+          ) : (
+            <div className="flex-1 flex items-center justify-center bg-bg3/50 rounded-lg border border-white/5">
+              <p className="text-sm text-text-dim">
+                Click a scene to preview
+              </p>
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   )
 }

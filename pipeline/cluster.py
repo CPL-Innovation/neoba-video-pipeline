@@ -26,7 +26,7 @@ def run_clustering(run_name: str) -> dict:
     import umap
     import hdbscan
 
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     item_ids, descriptions = load_descriptions()

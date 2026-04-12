@@ -67,7 +67,7 @@ class EditRequest(BaseModel):
 # --- Helpers ---
 
 def get_latest_run() -> str | None:
-    runs_dir = DATA_DIR / "runs"
+    runs_dir = DATA_DIR / "runs" / "catalog"
     if not runs_dir.exists():
         return None
     runs = sorted([d.name for d in runs_dir.iterdir() if d.is_dir()], reverse=True)
@@ -80,7 +80,7 @@ def get_run_dir(run_id: str) -> Path:
         if not latest:
             raise HTTPException(404, "No runs found")
         run_id = latest
-    run_dir = DATA_DIR / "runs" / run_id
+    run_dir = DATA_DIR / "runs" / "catalog" / run_id
     if not run_dir.exists():
         raise HTTPException(404, f"Run not found: {run_id}")
     return run_dir
@@ -101,7 +101,7 @@ async def get_source_items():
 
 @app.get("/api/runs")
 async def list_runs():
-    runs_dir = DATA_DIR / "runs"
+    runs_dir = DATA_DIR / "runs" / "catalog"
     if not runs_dir.exists():
         return []
     result = []

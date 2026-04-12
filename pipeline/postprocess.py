@@ -60,7 +60,7 @@ def _apply_entity_merges(entities: dict[str, dict], merges: list[dict]) -> dict[
 
 def build_entity_index(run_name: str) -> list[dict]:
     """Build deduplicated entity index from classifications, with merge overlay."""
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     cls_file = run_dir / "classifications.json"
 
     if not cls_file.exists():
@@ -101,7 +101,7 @@ def build_entity_index(run_name: str) -> list[dict]:
 
 def suggest_entity_merges(run_name: str) -> list[dict]:
     """Detect likely merge candidates using substring, abbreviation, and prefix matching."""
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     entity_file = run_dir / "entity_index.json"
 
     if not entity_file.exists():
@@ -192,7 +192,7 @@ def suggest_entity_merges(run_name: str) -> list[dict]:
 
 def get_single_name_entities(run_name: str) -> list[dict]:
     """Get people entities that are a single name (no space) with count >= 3."""
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     entity_file = run_dir / "entity_index.json"
 
     if not entity_file.exists():
@@ -236,7 +236,7 @@ def get_single_name_entities(run_name: str) -> list[dict]:
 
 def aggregate_proposed_threads(run_name: str) -> list[dict]:
     """Aggregate proposed threads from classifications."""
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     cls_file = run_dir / "classifications.json"
 
     if not cls_file.exists():
@@ -326,7 +326,7 @@ def aggregate_proposed_threads(run_name: str) -> list[dict]:
 
 def get_cryptic_items(run_name: str) -> list[dict]:
     """Get all cryptic items with source metadata."""
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     cls_file = run_dir / "classifications.json"
 
     if not cls_file.exists():

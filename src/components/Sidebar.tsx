@@ -10,7 +10,7 @@ const sections: NavEntry[] = [
   {
     kind: 'group',
     id: 'classifier',
-    label: 'Classifier',
+    label: 'Catalog Classifier',
     items: [
       { to: '/run', label: 'Run Classification', icon: '▶' },
       { to: '/review', label: 'Review Table', icon: '☰' },

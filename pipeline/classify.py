@@ -227,7 +227,7 @@ def run_classification(
     """Run full Tier 1+2 classification pipeline. Supports stop/resume."""
     clear_stop(run_name)
 
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     raw_dir = run_dir / "raw_responses"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,7 +344,7 @@ def run_classification_subset(
     """Classify a specific subset of items and merge into existing run results."""
     clear_stop(run_name)
 
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     config = load_thread_config()

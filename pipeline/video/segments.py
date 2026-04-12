@@ -1,9 +1,9 @@
-"""Chapter detection via black-slug analysis.
+"""Segment detection via black-slug analysis.
 
-Chapters are narrative units made of scenes. Black slugs — scenes whose
-keyframes are nearly all-black — serve as chapter boundaries. This module
+Segments are narrative units made of scenes. Black slugs — scenes whose
+keyframes are nearly all-black — serve as segment boundaries. This module
 analyzes the already-extracted keyframe JPEGs (no video re-scan needed)
-to detect slugs and group scenes into chapters.
+to detect slugs and group scenes into segments.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ DEFAULT_LUMINANCE_THRESHOLD = 10  # out of 255
 DEFAULT_MIN_DURATION = 0.5  # seconds
 
 
-class Chapter(TypedDict):
-    chapter_id: str
+class Segment(TypedDict):
+    segment_id: str
     type: str  # "content" | "boundary"
     name: str
     scene_ids: list[str]
@@ -63,7 +63,7 @@ def detect_black_slugs(
     if result is None:
         raise ValueError(f"No ingest output for {video_id}")
 
-    # Work on the merged view so chapter detection respects user merges
+    # Work on the merged view so segment detection respects user merges
     merges = load_merges(video_id)
     scenes = apply_merges(result["scenes"], merges)
 
@@ -89,14 +89,14 @@ def detect_black_slugs(
     return slug_ids
 
 
-def build_chapters(
+def build_segments(
     video_id: str,
     luminance_threshold: float = DEFAULT_LUMINANCE_THRESHOLD,
     min_duration: float = DEFAULT_MIN_DURATION,
 ) -> IngestResult:
-    """Detect black slugs, tag scenes, and group them into chapters.
+    """Detect black slugs, tag scenes, and group them into segments.
 
-    Writes the updated scenes.json with chapters array, chapter_detector
+    Writes the updated scenes.json with segments array, segment_detector
     metadata, and scene tags. Returns the updated result.
     """
     result = load_ingest_result(video_id)
@@ -119,26 +119,26 @@ def build_chapters(
             tags.append("black_slug")
         scene["tags"] = tags  # type: ignore[typeddict-unknown-key]
 
-    # Build chapters by grouping consecutive scenes.
-    # chapter_index is a monotonic counter for unique IDs across all chapters.
-    # content_number counts only content chapters for sequential naming.
-    chapters: list[Chapter] = []
-    chapter_index = 0
+    # Build segments by grouping consecutive scenes.
+    # segment_index is a monotonic counter for unique IDs across all segments.
+    # content_number counts only content segments for sequential naming.
+    segments: list[Segment] = []
+    segment_index = 0
     content_number = 0
     current_content_scenes: list[dict] = []
 
     def flush_content() -> None:
-        nonlocal chapter_index, content_number
+        nonlocal segment_index, content_number
         if not current_content_scenes:
             return
-        chapter_index += 1
+        segment_index += 1
         content_number += 1
         first = current_content_scenes[0]
         last = current_content_scenes[-1]
-        chapters.append({
-            "chapter_id": f"{video_id}_chapter_{chapter_index:03d}",
+        segments.append({
+            "segment_id": f"{video_id}_segment_{segment_index:03d}",
             "type": "content",
-            "name": f"Chapter {content_number}",
+            "name": f"Segment {content_number}",
             "scene_ids": [s["scene_id"] for s in current_content_scenes],
             "start": round(first["start"], 3),
             "end": round(last["end"], 3),
@@ -146,13 +146,13 @@ def build_chapters(
 
     for scene in scenes:
         if scene["scene_id"] in slug_set:
-            # Flush any accumulated content scenes as a content chapter
+            # Flush any accumulated content scenes as a content segment
             flush_content()
             current_content_scenes = []
-            # Create a boundary chapter for this slug
-            chapter_index += 1
-            chapters.append({
-                "chapter_id": f"{video_id}_chapter_{chapter_index:03d}",
+            # Create a boundary segment for this slug
+            segment_index += 1
+            segments.append({
+                "segment_id": f"{video_id}_segment_{segment_index:03d}",
                 "type": "boundary",
                 "name": "Boundary",
                 "scene_ids": [scene["scene_id"]],
@@ -174,9 +174,9 @@ def build_chapters(
             tags.append("black_slug")
         scene["tags"] = tags  # type: ignore[typeddict-unknown-key]
 
-    # Store chapters and detector config
-    result["chapters"] = chapters  # type: ignore[typeddict-unknown-key]
-    result["chapter_detector"] = {  # type: ignore[typeddict-unknown-key]
+    # Store segments and detector config
+    result["segments"] = segments  # type: ignore[typeddict-unknown-key]
+    result["segment_detector"] = {  # type: ignore[typeddict-unknown-key]
         "luminance_threshold": luminance_threshold,
         "min_duration": min_duration,
     }
@@ -188,16 +188,16 @@ def build_chapters(
     return result
 
 
-def rename_chapter(video_id: str, chapter_id: str, new_name: str) -> IngestResult:
-    """Rename a chapter in scenes.json."""
+def rename_segment(video_id: str, segment_id: str, new_name: str) -> IngestResult:
+    """Rename a segment in scenes.json."""
     result = load_ingest_result(video_id)
     if result is None:
         raise ValueError(f"No ingest output for {video_id}")
 
-    chapters = result.get("chapters", [])  # type: ignore[assignment]
-    target = next((c for c in chapters if c["chapter_id"] == chapter_id), None)
+    segments = result.get("segments", [])  # type: ignore[assignment]
+    target = next((c for c in segments if c["segment_id"] == segment_id), None)
     if target is None:
-        raise ValueError(f"Unknown chapter_id: {chapter_id}")
+        raise ValueError(f"Unknown segment_id: {segment_id}")
 
     target["name"] = new_name.strip()
 
@@ -208,15 +208,15 @@ def rename_chapter(video_id: str, chapter_id: str, new_name: str) -> IngestResul
     return result
 
 
-def clear_chapters(video_id: str) -> IngestResult:
-    """Remove chapter grouping data from scenes.json. Scene tags are preserved."""
+def clear_segments(video_id: str) -> IngestResult:
+    """Remove segment grouping data from scenes.json. Scene tags are preserved."""
     result = load_ingest_result(video_id)
     if result is None:
         raise ValueError(f"No ingest output for {video_id}")
 
-    # Remove chapter fields only — keep scene tags intact
-    result.pop("chapters", None)  # type: ignore[misc]
-    result.pop("chapter_detector", None)  # type: ignore[misc]
+    # Remove segment fields only — keep scene tags intact
+    result.pop("segments", None)  # type: ignore[misc]
+    result.pop("segment_detector", None)  # type: ignore[misc]
 
     run_dir = VIDEO_RUNS_DIR / video_id
     with open(run_dir / "scenes.json", "w") as f:

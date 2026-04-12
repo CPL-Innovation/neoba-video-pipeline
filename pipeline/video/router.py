@@ -17,10 +17,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from pipeline.video.chapters import (
-    build_chapters,
-    clear_chapters,
-    rename_chapter,
+from pipeline.video.segments import (
+    build_segments,
+    clear_segments,
+    rename_segment,
 )
 from pipeline.video.ingest import (
     VIDEO_RUNS_DIR,
@@ -212,11 +212,11 @@ def _merged_scenes_response(video_id: str) -> dict:
         "raw_scene_count": result["scene_count"],
         "merge_groups": merges["groups"],
     }
-    # Pass through chapter data if present
-    if "chapters" in result:
-        response["chapters"] = result["chapters"]  # type: ignore[index]
-    if "chapter_detector" in result:
-        response["chapter_detector"] = result["chapter_detector"]  # type: ignore[index]
+    # Pass through segment data if present
+    if "segments" in result:
+        response["segments"] = result["segments"]  # type: ignore[index]
+    if "segment_detector" in result:
+        response["segment_detector"] = result["segment_detector"]  # type: ignore[index]
     return response
 
 
@@ -668,25 +668,25 @@ async def get_keyframe(video_id: str, filename: str):
     )
 
 
-# ── Chapter detection ───────────────────────────────────────────────────
+# ── Segment detection ───────────────────────────────────────────────────
 
 
-class ChapterDetectRequest(BaseModel):
+class SegmentDetectRequest(BaseModel):
     luminance_threshold: float = 10
     min_duration: float = 1.0
 
 
-class ChapterRenameRequest(BaseModel):
+class SegmentRenameRequest(BaseModel):
     name: str
 
 
-@router.post("/videos/{video_id}/chapters/detect")
-async def detect_chapters(video_id: str, req: ChapterDetectRequest):
-    """Detect black slugs and group scenes into chapters."""
+@router.post("/videos/{video_id}/segments/detect")
+async def detect_segments(video_id: str, req: SegmentDetectRequest):
+    """Detect black slugs and group scenes into segments."""
     if load_ingest_result(video_id) is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
-        build_chapters(
+        build_segments(
             video_id,
             luminance_threshold=req.luminance_threshold,
             min_duration=req.min_duration,
@@ -696,27 +696,27 @@ async def detect_chapters(video_id: str, req: ChapterDetectRequest):
     return _merged_scenes_response(video_id)
 
 
-@router.patch("/videos/{video_id}/chapters/{chapter_id}/rename")
-async def rename_chapter_endpoint(
-    video_id: str, chapter_id: str, req: ChapterRenameRequest
+@router.patch("/videos/{video_id}/segments/{segment_id}/rename")
+async def rename_segment_endpoint(
+    video_id: str, segment_id: str, req: SegmentRenameRequest
 ):
-    """Rename a chapter."""
+    """Rename a segment."""
     if load_ingest_result(video_id) is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
-        rename_chapter(video_id, chapter_id, req.name)
+        rename_segment(video_id, segment_id, req.name)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)
 
 
-@router.delete("/videos/{video_id}/chapters")
-async def clear_chapters_endpoint(video_id: str):
-    """Remove all chapter data."""
+@router.delete("/videos/{video_id}/segments")
+async def clear_segments_endpoint(video_id: str):
+    """Remove all segment data."""
     if load_ingest_result(video_id) is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
-        clear_chapters(video_id)
+        clear_segments(video_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)

@@ -23,8 +23,8 @@ interface Scene {
   tags?: string[]
 }
 
-interface Chapter {
-  chapter_id: string
+interface Segment {
+  segment_id: string
   type: 'content' | 'boundary'
   name: string
   scene_ids: string[]
@@ -59,8 +59,8 @@ interface IngestResult {
   detector?: { name: string; threshold: number }
   raw_scene_count?: number
   merge_groups?: MergeGroup[]
-  chapters?: Chapter[]
-  chapter_detector?: { luminance_threshold: number; min_duration: number }
+  segments?: Segment[]
+  segment_detector?: { luminance_threshold: number; min_duration: number }
 }
 
 interface VideoSummary {
@@ -157,7 +157,7 @@ function ScenePlayer({
   const [dragging, setDragging] = useState(false)
   const sceneDuration = sceneEnd - sceneStart
 
-  // Filter transcript segments that overlap this scene/chapter range
+  // Filter transcript segments that overlap this scene/segment range
   const activeSegments = useMemo(() => {
     if (!transcriptSegments || transcriptSegments.length === 0) return []
     return transcriptSegments.filter(
@@ -467,16 +467,16 @@ export function Ingest() {
     null,
   )
   const [editingTimeValue, setEditingTimeValue] = useState('')
-  const [detectingChapters, setDetectingChapters] = useState(false)
-  const [editingChapterId, setEditingChapterId] = useState<string | null>(null)
-  const [editingChapterName, setEditingChapterName] = useState('')
-  const [collapsedChapters, setCollapsedChapters] = useState<Set<string>>(
+  const [detectingSegments, setDetectingSegments] = useState(false)
+  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null)
+  const [editingSegmentName, setEditingSegmentName] = useState('')
+  const [collapsedSegments, setCollapsedSegments] = useState<Set<string>>(
     new Set(),
   )
-  const [chapterFilter, setChapterFilter] = useState<
+  const [segmentFilter, setSegmentFilter] = useState<
     'all' | 'content' | 'boundary'
   >('all')
-  const [previewChapterId, setPreviewChapterId] = useState<string | null>(null)
+  const [previewSegmentId, setPreviewSegmentId] = useState<string | null>(null)
   const [transcriptSegments, setTranscriptSegments] = useState<
     TranscriptSegment[] | null
   >(null)
@@ -490,20 +490,20 @@ export function Ingest() {
   const previewScene = result?.scenes.find(
     (s) => s.scene_id === previewSceneId,
   )
-  const previewChapter = previewChapterId
-    ? result?.chapters?.find((c) => c.chapter_id === previewChapterId) ?? null
+  const previewSegment = previewSegmentId
+    ? result?.segments?.find((c) => c.segment_id === previewSegmentId) ?? null
     : null
   const videoUrl = result ? deriveVideoUrl(result) : null
 
   const pendingMergeCount =
     result?.merge_groups?.filter((g) => g.status === 'pending').length ?? 0
 
-  // Build chapter lookup: scene_id → chapter
-  const chapterBySceneId = new Map<string, Chapter>()
-  if (result?.chapters) {
-    for (const ch of result.chapters) {
+  // Build segment lookup: scene_id → segment
+  const segmentBySceneId = new Map<string, Segment>()
+  if (result?.segments) {
+    for (const ch of result.segments) {
       for (const sid of ch.scene_ids) {
-        chapterBySceneId.set(sid, ch)
+        segmentBySceneId.set(sid, ch)
       }
     }
   }
@@ -521,10 +521,10 @@ export function Ingest() {
       return false
     if (durationMaxNum !== null && !isNaN(durationMaxNum) && dur > durationMaxNum)
       return false
-    // Chapter type filter
-    if (chapterFilter !== 'all' && chapterBySceneId.size > 0) {
-      const ch = chapterBySceneId.get(scene.scene_id)
-      if (ch && ch.type !== chapterFilter) return false
+    // Segment type filter
+    if (segmentFilter !== 'all' && segmentBySceneId.size > 0) {
+      const ch = segmentBySceneId.get(scene.scene_id)
+      if (ch && ch.type !== segmentFilter) return false
     }
     return true
   })
@@ -782,15 +782,15 @@ export function Ingest() {
     }
   }
 
-  // ── Chapter actions ───────────────────────────────────────────────────
+  // ── Segment actions ───────────────────────────────────────────────────
 
-  const runDetectChapters = async () => {
+  const runDetectSegments = async () => {
     if (!result) return
-    setDetectingChapters(true)
+    setDetectingSegments(true)
     setError(null)
     try {
       const res = await fetch(
-        `/api/video/videos/${result.video_id}/chapters/detect`,
+        `/api/video/videos/${result.video_id}/segments/detect`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -800,23 +800,23 @@ export function Ingest() {
       if (!res.ok) {
         const err = await res
           .json()
-          .catch(() => ({ detail: 'Chapter detection failed' }))
-        throw new Error(err.detail || 'Chapter detection failed')
+          .catch(() => ({ detail: 'Segment detection failed' }))
+        throw new Error(err.detail || 'Segment detection failed')
       }
       setResult(await res.json())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setDetectingChapters(false)
+      setDetectingSegments(false)
     }
   }
 
-  const clearChapters = async () => {
+  const clearSegments = async () => {
     if (!result) return
     setError(null)
     try {
       const res = await fetch(
-        `/api/video/videos/${result.video_id}/chapters`,
+        `/api/video/videos/${result.video_id}/segments`,
         { method: 'DELETE' },
       )
       if (!res.ok) {
@@ -826,23 +826,23 @@ export function Ingest() {
         throw new Error(err.detail || 'Clear failed')
       }
       setResult(await res.json())
-      setCollapsedChapters(new Set())
+      setCollapsedSegments(new Set())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  const commitChapterRename = async () => {
-    if (!result || !editingChapterId) return
-    const newName = editingChapterName.trim()
+  const commitSegmentRename = async () => {
+    if (!result || !editingSegmentId) return
+    const newName = editingSegmentName.trim()
     if (!newName) {
-      setEditingChapterId(null)
+      setEditingSegmentId(null)
       return
     }
     setError(null)
     try {
       const res = await fetch(
-        `/api/video/videos/${result.video_id}/chapters/${editingChapterId}/rename`,
+        `/api/video/videos/${result.video_id}/segments/${editingSegmentId}/rename`,
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -859,15 +859,15 @@ export function Ingest() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setEditingChapterId(null)
+      setEditingSegmentId(null)
     }
   }
 
-  const toggleChapterCollapsed = (chapterId: string) => {
-    setCollapsedChapters((prev) => {
+  const toggleSegmentCollapsed = (segmentId: string) => {
+    setCollapsedSegments((prev) => {
       const next = new Set(prev)
-      if (next.has(chapterId)) next.delete(chapterId)
-      else next.add(chapterId)
+      if (next.has(segmentId)) next.delete(segmentId)
+      else next.add(segmentId)
       return next
     })
   }
@@ -964,7 +964,7 @@ export function Ingest() {
     setError(null)
     setStatus(null)
     setPreviewSceneId(null)
-    setPreviewChapterId(null)
+    setPreviewSegmentId(null)
     setTranscriptSegments(null)
     clearSelection()
     try {
@@ -998,7 +998,7 @@ export function Ingest() {
     setView('list')
     setResult(null)
     setPreviewSceneId(null)
-    setPreviewChapterId(null)
+    setPreviewSegmentId(null)
     setTranscriptSegments(null)
     clearSelection()
     setError(null)
@@ -1220,11 +1220,11 @@ export function Ingest() {
                   {pendingMergeCount} pending
                 </span>
               )}
-              {result.chapters && result.chapters.length > 0 && (
+              {result.segments && result.segments.length > 0 && (
                 <span className="text-teal">
                   {' · '}
-                  {result.chapters.filter((c) => c.type === 'content').length}{' '}
-                  chapters
+                  {result.segments.filter((c) => c.type === 'content').length}{' '}
+                  segments
                 </span>
               )}
               {' · '}{fmtTime(result.duration)}
@@ -1244,18 +1244,18 @@ export function Ingest() {
               {pendingMergeCount === 1 ? '' : 's'}
             </Button>
           )}
-          {result.chapters && result.chapters.length > 0 ? (
-            <Button onClick={clearChapters} variant="secondary" size="sm">
-              Clear Chapters
+          {result.segments && result.segments.length > 0 ? (
+            <Button onClick={clearSegments} variant="secondary" size="sm">
+              Clear Segments
             </Button>
           ) : (
             <Button
-              onClick={runDetectChapters}
-              disabled={detectingChapters}
+              onClick={runDetectSegments}
+              disabled={detectingSegments}
               variant="secondary"
               size="sm"
             >
-              {detectingChapters ? 'Detecting…' : 'Detect Chapters'}
+              {detectingSegments ? 'Detecting…' : 'Detect Segments'}
             </Button>
           )}
         </div>
@@ -1290,22 +1290,22 @@ export function Ingest() {
           />
           <span className="text-xs text-text-dim">sec</span>
         </div>
-        {chapterBySceneId.size > 0 && (
+        {segmentBySceneId.size > 0 && (
           <>
-            <span className="text-xs text-text-muted ml-2">Chapter:</span>
+            <span className="text-xs text-text-muted ml-2">Segment:</span>
             <div className="flex items-center gap-0.5 bg-bg3 border border-white/10 rounded overflow-hidden">
               {(['all', 'content', 'boundary'] as const).map((val) => {
                 const count =
                   val === 'all'
-                    ? result.chapters?.length ?? 0
-                    : result.chapters?.filter((c) => c.type === val).length ?? 0
+                    ? result.segments?.length ?? 0
+                    : result.segments?.filter((c) => c.type === val).length ?? 0
                 return (
                   <button
                     key={val}
                     type="button"
-                    onClick={() => setChapterFilter(val)}
+                    onClick={() => setSegmentFilter(val)}
                     className={`px-2 py-1 text-xs capitalize ${
-                      chapterFilter === val
+                      segmentFilter === val
                         ? 'bg-white/10 text-text-primary'
                         : 'text-text-dim hover:text-text-muted'
                     }`}
@@ -1318,7 +1318,7 @@ export function Ingest() {
             </div>
           </>
         )}
-        {(hasDurationFilter || chapterFilter !== 'all') && (
+        {(hasDurationFilter || segmentFilter !== 'all') && (
           <>
             <span className="text-xs text-maize tabular-nums">
               {filteredScenes?.length ?? 0} / {result.scenes.length} scenes
@@ -1328,7 +1328,7 @@ export function Ingest() {
               onClick={() => {
                 setDurationMin('')
                 setDurationMax('')
-                setChapterFilter('all')
+                setSegmentFilter('all')
               }}
               className="text-xs text-text-dim hover:text-text-primary"
             >
@@ -1352,51 +1352,51 @@ export function Ingest() {
               const firstKf = scene.keyframes[0]
               const hasBlackSlug = scene.tags?.includes('black_slug')
 
-              // Chapter header: render before the first scene in each chapter
-              const chapter = chapterBySceneId.get(scene.scene_id)
-              const isFirstInChapter =
-                chapter && chapter.scene_ids[0] === scene.scene_id
+              // Segment header: render before the first scene in each segment
+              const segment =segmentBySceneId.get(scene.scene_id)
+              const isFirstInSegment =
+                segment && segment.scene_ids[0] === scene.scene_id
               const isCollapsed =
-                chapter && collapsedChapters.has(chapter.chapter_id)
+                segment && collapsedSegments.has(segment.segment_id)
 
-              // If this scene's chapter is collapsed and it's not the first scene, skip
-              if (chapter && !isFirstInChapter && isCollapsed) return null
+              // If this scene's segment is collapsed and it's not the first scene, skip
+              if (segment && !isFirstInSegment && isCollapsed) return null
 
               return (
                 <div key={scene.scene_id}>
-                  {/* Chapter header */}
-                  {isFirstInChapter && chapter && (
+                  {/* Segment header */}
+                  {isFirstInSegment && segment && (
                     <div
                       className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
-                        previewChapterId === chapter.chapter_id
+                        previewSegmentId === segment.segment_id
                           ? 'ring-1 ring-maize/40 '
                           : ''
                       }${
-                        chapter.type === 'boundary'
+                        segment.type === 'boundary'
                           ? 'border-white/5 bg-white/[0.02] hover:bg-white/[0.04]'
                           : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.06]'
                       }`}
                       onClick={() => {
-                        toggleChapterCollapsed(chapter.chapter_id)
-                        setPreviewChapterId(chapter.chapter_id)
+                        toggleSegmentCollapsed(segment.segment_id)
+                        setPreviewSegmentId(segment.segment_id)
                         setPreviewSceneId(null)
                       }}
                     >
                       <span className="text-text-dim text-[10px] leading-none shrink-0 w-4 text-center">
                         {isCollapsed ? '▸' : '▾'}
                       </span>
-                      {editingChapterId === chapter.chapter_id ? (
+                      {editingSegmentId === segment.segment_id ? (
                         <input
                           type="text"
-                          value={editingChapterName}
+                          value={editingSegmentName}
                           onChange={(e) =>
-                            setEditingChapterName(e.target.value)
+                            setEditingSegmentName(e.target.value)
                           }
-                          onBlur={commitChapterRename}
+                          onBlur={commitSegmentRename}
                           onKeyDown={(e) => {
-                            if (e.key === 'Enter') commitChapterRename()
+                            if (e.key === 'Enter') commitSegmentRename()
                             if (e.key === 'Escape')
-                              setEditingChapterId(null)
+                              setEditingSegmentId(null)
                           }}
                           onClick={(e) => e.stopPropagation()}
                           autoFocus
@@ -1407,31 +1407,31 @@ export function Ingest() {
                           className="text-xs font-medium text-text-primary truncate flex-1 cursor-text"
                           onDoubleClick={(e) => {
                             e.stopPropagation()
-                            setEditingChapterId(chapter.chapter_id)
-                            setEditingChapterName(chapter.name)
+                            setEditingSegmentId(segment.segment_id)
+                            setEditingSegmentName(segment.name)
                           }}
                           title="Double-click to rename"
                         >
-                          {chapter.name}
+                          {segment.name}
                         </span>
                       )}
                       <span className="text-[10px] text-text-dim font-mono shrink-0">
-                        {chapter.chapter_id.split('_').pop()}
+                        {segment.segment_id.split('_').pop()}
                       </span>
                       <span
                         className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
-                          chapter.type === 'boundary'
+                          segment.type === 'boundary'
                             ? 'bg-white/5 text-text-dim'
                             : 'bg-teal/10 text-teal'
                         }`}
                       >
-                        {chapter.type}
+                        {segment.type}
                       </span>
                       <span className="text-[10px] text-text-dim shrink-0 tabular-nums">
-                        {chapter.scene_ids.length} scene
-                        {chapter.scene_ids.length === 1 ? '' : 's'}
+                        {segment.scene_ids.length} scene
+                        {segment.scene_ids.length === 1 ? '' : 's'}
                         {' · '}
-                        {fmtTime(chapter.start)}→{fmtTime(chapter.end)}
+                        {fmtTime(segment.start)}→{fmtTime(segment.end)}
                       </span>
                     </div>
                   )}
@@ -1446,7 +1446,7 @@ export function Ingest() {
                       } ${isSelected ? 'ring-1 ring-maize/60' : ''}`}
                       onClick={() => {
                         setPreviewSceneId(scene.scene_id)
-                        setPreviewChapterId(null)
+                        setPreviewSegmentId(null)
                       }}
                     >
                       {/* Checkbox */}
@@ -1631,9 +1631,9 @@ export function Ingest() {
 
         {/* Right: Preview panel */}
         <div className="w-[45%] shrink-0 flex flex-col min-h-0">
-          {previewChapter ? (() => {
-            // Chapter preview mode
-            const chScenes = previewChapter.scene_ids
+          {previewSegment ? (() => {
+            // Segment preview mode
+            const chScenes = previewSegment.scene_ids
               .map((sid) => result.scenes.find((s) => s.scene_id === sid))
               .filter(Boolean) as Scene[]
             const allKeyframes = chScenes
@@ -1641,23 +1641,23 @@ export function Ingest() {
               .sort((a, b) => a.timestamp - b.timestamp)
             // Check contiguity
             const sceneIds = result.scenes.map((s) => s.scene_id)
-            const positions = previewChapter.scene_ids
+            const positions = previewSegment.scene_ids
               .map((sid) => sceneIds.indexOf(sid))
               .filter((i) => i !== -1)
               .sort((a, b) => a - b)
             const isContiguous =
               positions.length > 0 &&
               positions[positions.length - 1] - positions[0] === positions.length - 1
-            const chDuration = previewChapter.end - previewChapter.start
+            const chDuration = previewSegment.end - previewSegment.start
 
             return (
               <div className="flex-1 overflow-y-auto space-y-4 bg-bg3/50 rounded-lg p-4 border border-white/5">
                 {videoUrl ? (
                   <ScenePlayer
-                    key={`ch-${previewChapter.chapter_id}`}
+                    key={`ch-${previewSegment.segment_id}`}
                     src={videoUrl}
-                    sceneStart={previewChapter.start}
-                    sceneEnd={previewChapter.end}
+                    sceneStart={previewSegment.start}
+                    sceneEnd={previewSegment.end}
                     transcriptSegments={transcriptSegments}
                   />
                 ) : (
@@ -1670,25 +1670,25 @@ export function Ingest() {
 
                 <div className="space-y-1">
                   <h3 className="text-sm font-medium text-text-primary">
-                    {previewChapter.name}
+                    {previewSegment.name}
                   </h3>
                   <p className="text-xs text-text-dim">
-                    {fmtTime(previewChapter.start)} → {fmtTime(previewChapter.end)}
+                    {fmtTime(previewSegment.start)} → {fmtTime(previewSegment.end)}
                     <span> · {chDuration.toFixed(1)}s</span>
-                    {' · '}{previewChapter.scene_ids.length} scene
-                    {previewChapter.scene_ids.length === 1 ? '' : 's'}
+                    {' · '}{previewSegment.scene_ids.length} scene
+                    {previewSegment.scene_ids.length === 1 ? '' : 's'}
                     {' · '}{allKeyframes.length} keyframe
                     {allKeyframes.length === 1 ? '' : 's'}
                   </p>
                   <div className="flex gap-1.5 flex-wrap">
                     <span
                       className={`px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
-                        previewChapter.type === 'boundary'
+                        previewSegment.type === 'boundary'
                           ? 'bg-white/5 text-text-dim'
                           : 'bg-teal/10 text-teal'
                       }`}
                     >
-                      {previewChapter.type}
+                      {previewSegment.type}
                     </span>
                     {!isContiguous && (
                       <span className="px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-coral/15 text-coral">
@@ -1717,8 +1717,8 @@ export function Ingest() {
                         <TranscriptPanel
                           segments={transcriptSegments.filter(
                             (s) =>
-                              s.end > previewChapter.start &&
-                              s.start < previewChapter.end,
+                              s.end > previewSegment.start &&
+                              s.start < previewSegment.end,
                           )}
                           videoId={result.video_id}
                           onUpdate={setTranscriptSegments}
@@ -1872,9 +1872,9 @@ export function Ingest() {
                     )
                   })()}
                 </div>
-                {/* Chapter info */}
+                {/* Segment info */}
                 {(() => {
-                  const ch = chapterBySceneId.get(previewScene.scene_id)
+                  const ch = segmentBySceneId.get(previewScene.scene_id)
                   if (!ch) return null
                   return (
                     <p className="text-xs text-text-dim">
@@ -2037,7 +2037,7 @@ export function Ingest() {
           ) : (
             <div className="flex-1 flex items-center justify-center bg-bg3/50 rounded-lg border border-white/5">
               <p className="text-sm text-text-dim">
-                Click a scene or chapter to preview
+                Click a scene or segment to preview
               </p>
             </div>
           )}

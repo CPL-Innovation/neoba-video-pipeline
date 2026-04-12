@@ -77,7 +77,7 @@ def _apply_entity_renames(entities_dict: dict, rename_map: dict[str, str]) -> di
 
 def export_enriched_data(run_name: str) -> dict:
     """Generate all export files for the dashboard."""
-    run_dir = DATA_DIR / "runs" / run_name
+    run_dir = DATA_DIR / "runs" / "catalog" / run_name
     export_dir = DATA_DIR / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
 

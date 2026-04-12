@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PageHeader } from '../../../components/PageHeader'
 import { Card } from '../../../components/Card'
 import { Button } from '../../../components/Button'
@@ -20,6 +20,23 @@ interface Scene {
   keyframes: Keyframe[]
   merged_from?: string[]
   merge_status?: 'pending' | 'committed'
+  tags?: string[]
+}
+
+interface Chapter {
+  chapter_id: string
+  type: 'content' | 'boundary'
+  name: string
+  scene_ids: string[]
+  start: number
+  end: number
+}
+
+interface TranscriptSegment {
+  id: number
+  start: number
+  end: number
+  text: string
 }
 
 interface MergeGroup {
@@ -42,6 +59,8 @@ interface IngestResult {
   detector?: { name: string; threshold: number }
   raw_scene_count?: number
   merge_groups?: MergeGroup[]
+  chapters?: Chapter[]
+  chapter_detector?: { luminance_threshold: number; min_duration: number }
 }
 
 interface VideoSummary {
@@ -122,10 +141,14 @@ function ScenePlayer({
   src,
   sceneStart,
   sceneEnd,
+  transcriptSegments,
+  onTimeUpdate,
 }: {
   src: string
   sceneStart: number
   sceneEnd: number
+  transcriptSegments?: TranscriptSegment[] | null
+  onTimeUpdate?: (absoluteTime: number) => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
@@ -133,6 +156,17 @@ function ScenePlayer({
   const [currentTime, setCurrent] = useState(0) // relative to sceneStart
   const [dragging, setDragging] = useState(false)
   const sceneDuration = sceneEnd - sceneStart
+
+  // Filter transcript segments that overlap this scene/chapter range
+  const activeSegments = useMemo(() => {
+    if (!transcriptSegments || transcriptSegments.length === 0) return []
+    return transcriptSegments.filter(
+      (seg) => seg.end > sceneStart && seg.start < sceneEnd && seg.text.trim(),
+    )
+  }, [transcriptSegments, sceneStart, sceneEnd])
+
+  // Current subtitle text based on playback position
+  const [subtitleText, setSubtitleText] = useState('')
 
   // Clamp video to scene bounds
   const clamp = useCallback(() => {
@@ -151,7 +185,14 @@ function ScenePlayer({
     if (!v) return
     const onTime = () => {
       clamp()
-      setCurrent(v.currentTime - sceneStart)
+      const t = v.currentTime
+      setCurrent(t - sceneStart)
+      onTimeUpdate?.(t)
+      // Update subtitle
+      if (activeSegments.length > 0) {
+        const seg = activeSegments.find((s) => t >= s.start && t < s.end)
+        setSubtitleText(seg?.text.trim() ?? '')
+      }
     }
     const onPause = () => setPlaying(false)
     const onPlay = () => setPlaying(true)
@@ -163,7 +204,7 @@ function ScenePlayer({
       v.removeEventListener('pause', onPause)
       v.removeEventListener('play', onPlay)
     }
-  }, [sceneStart, clamp])
+  }, [sceneStart, clamp, activeSegments])
 
   // Reset on scene change
   useEffect(() => {
@@ -221,6 +262,15 @@ function ScenePlayer({
         onClick={togglePlay}
       />
 
+      {/* Subtitle overlay */}
+      {subtitleText && (
+        <div className="absolute bottom-12 left-2 right-2 flex justify-center pointer-events-none">
+          <span className="bg-black/80 text-white text-xs px-2 py-1 rounded max-w-[90%] text-center leading-relaxed">
+            {subtitleText}
+          </span>
+        </div>
+      )}
+
       {/* Custom controls overlay */}
       <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-2 pb-1.5 pt-4">
         {/* Seek bar */}
@@ -264,6 +314,128 @@ function ScenePlayer({
   )
 }
 
+// ── Transcript editor panel ────────────────────────────────────────────
+
+function TranscriptPanel({
+  segments,
+  videoId,
+  onUpdate,
+  onSeek,
+}: {
+  segments: TranscriptSegment[]
+  videoId: string
+  onUpdate: (updated: TranscriptSegment[]) => void
+  onSeek?: (time: number) => void
+}) {
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [editText, setEditText] = useState('')
+
+  const saveSegment = async (id: number, text: string) => {
+    try {
+      const res = await fetch(
+        `/api/video/videos/${videoId}/transcript/segments`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ updates: [{ id, text }] }),
+        },
+      )
+      if (res.ok) {
+        const data = await res.json()
+        onUpdate(data.segments)
+      }
+    } catch {
+      /* silent */
+    }
+    setEditingId(null)
+  }
+
+  const deleteSegment = async (id: number) => {
+    try {
+      const res = await fetch(
+        `/api/video/videos/${videoId}/transcript/segments`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deletions: [id] }),
+        },
+      )
+      if (res.ok) {
+        const data = await res.json()
+        onUpdate(data.segments)
+      }
+    } catch {
+      /* silent */
+    }
+  }
+
+  if (segments.length === 0) {
+    return (
+      <div className="text-xs text-text-dim italic py-2">
+        No transcript segments in this range.
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-1 max-h-48 overflow-y-auto">
+      {segments.map((seg) => (
+        <div
+          key={seg.id}
+          className="flex gap-2 items-start text-xs group/seg"
+        >
+          <span
+            className={`shrink-0 font-mono tabular-nums pt-1 w-20 ${
+              onSeek
+                ? 'text-text-muted hover:text-maize cursor-pointer'
+                : 'text-text-dim'
+            }`}
+            onClick={() => onSeek?.(seg.start)}
+            title="Jump to this segment"
+          >
+            {fmtTime(seg.start)}–{fmtTime(seg.end)}
+          </span>
+          {editingId === seg.id ? (
+            <textarea
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onBlur={() => saveSegment(seg.id, editText)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  saveSegment(seg.id, editText)
+                }
+                if (e.key === 'Escape') setEditingId(null)
+              }}
+              autoFocus
+              rows={2}
+              className="flex-1 bg-bg3 border border-maize/50 rounded px-2 py-1 text-text-primary text-xs resize-none focus:outline-none"
+            />
+          ) : (
+            <span
+              className="flex-1 text-text-muted cursor-text py-1 hover:text-text-primary"
+              onClick={() => {
+                setEditingId(seg.id)
+                setEditText(seg.text)
+              }}
+            >
+              {seg.text.trim() || '(empty)'}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => deleteSegment(seg.id)}
+            className="shrink-0 text-text-dim hover:text-coral text-xs leading-none pt-1 opacity-0 group-hover/seg:opacity-100 transition-opacity"
+            title="Delete segment"
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ── Main component ──────────────────────────────────────────────────────
 
 export function Ingest() {
@@ -291,15 +463,50 @@ export function Ingest() {
   const [editingName, setEditingName] = useState('')
   const [durationMin, setDurationMin] = useState('')
   const [durationMax, setDurationMax] = useState('')
+  const [editingTimeSceneId, setEditingTimeSceneId] = useState<string | null>(
+    null,
+  )
+  const [editingTimeValue, setEditingTimeValue] = useState('')
+  const [detectingChapters, setDetectingChapters] = useState(false)
+  const [editingChapterId, setEditingChapterId] = useState<string | null>(null)
+  const [editingChapterName, setEditingChapterName] = useState('')
+  const [collapsedChapters, setCollapsedChapters] = useState<Set<string>>(
+    new Set(),
+  )
+  const [chapterFilter, setChapterFilter] = useState<
+    'all' | 'content' | 'boundary'
+  >('all')
+  const [previewChapterId, setPreviewChapterId] = useState<string | null>(null)
+  const [transcriptSegments, setTranscriptSegments] = useState<
+    TranscriptSegment[] | null
+  >(null)
+  const [showTranscript, setShowTranscript] = useState(false)
+  const [validTags, setValidTags] = useState<string[]>([])
+  const [currentPlaybackTime, setCurrentPlaybackTime] = useState<number | null>(
+    null,
+  )
 
   const isRunning = status?.status === 'running'
   const previewScene = result?.scenes.find(
     (s) => s.scene_id === previewSceneId,
   )
+  const previewChapter = previewChapterId
+    ? result?.chapters?.find((c) => c.chapter_id === previewChapterId) ?? null
+    : null
   const videoUrl = result ? deriveVideoUrl(result) : null
 
   const pendingMergeCount =
     result?.merge_groups?.filter((g) => g.status === 'pending').length ?? 0
+
+  // Build chapter lookup: scene_id → chapter
+  const chapterBySceneId = new Map<string, Chapter>()
+  if (result?.chapters) {
+    for (const ch of result.chapters) {
+      for (const sid of ch.scene_ids) {
+        chapterBySceneId.set(sid, ch)
+      }
+    }
+  }
 
   // Duration filter
   const durationMinNum = durationMin === '' ? null : parseFloat(durationMin)
@@ -314,6 +521,11 @@ export function Ingest() {
       return false
     if (durationMaxNum !== null && !isNaN(durationMaxNum) && dur > durationMaxNum)
       return false
+    // Chapter type filter
+    if (chapterFilter !== 'all' && chapterBySceneId.size > 0) {
+      const ch = chapterBySceneId.get(scene.scene_id)
+      if (ch && ch.type !== chapterFilter) return false
+    }
     return true
   })
 
@@ -491,6 +703,61 @@ export function Ingest() {
 
   const cancelEditing = () => setEditingSceneId(null)
 
+  // ── Time range editing ──────────────────────────────────────────────
+
+  const parseTime = (str: string): number | null => {
+    const parts = str.split(':')
+    if (parts.length !== 2) return null
+    const m = parseInt(parts[0], 10)
+    const s = parseFloat(parts[1])
+    if (isNaN(m) || isNaN(s)) return null
+    return m * 60 + s
+  }
+
+  const startEditingTime = (sceneId: string, start: number, end: number) => {
+    setEditingTimeSceneId(sceneId)
+    setEditingTimeValue(`${fmtTime(start)}→${fmtTime(end)}`)
+  }
+
+  const commitTimeRange = async () => {
+    if (!result || !editingTimeSceneId) return
+    const parts = editingTimeValue.split('→')
+    if (parts.length !== 2) {
+      setEditingTimeSceneId(null)
+      return
+    }
+    const newStart = parseTime(parts[0].trim())
+    const newEnd = parseTime(parts[1].trim())
+    if (newStart === null || newEnd === null || newStart >= newEnd) {
+      setEditingTimeSceneId(null)
+      return
+    }
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/scenes/time-range`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            scene_id: editingTimeSceneId,
+            start: newStart,
+            end: newEnd,
+          }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Failed' }))
+        throw new Error(err.detail || 'Failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setEditingTimeSceneId(null)
+    }
+  }
+
   // ── Keyframe deletion ────────────────────────────────────────────────
 
   const deleteKeyframe = async (sceneId: string, kfPath: string) => {
@@ -513,6 +780,96 @@ export function Ingest() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  // ── Chapter actions ───────────────────────────────────────────────────
+
+  const runDetectChapters = async () => {
+    if (!result) return
+    setDetectingChapters(true)
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/chapters/detect`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        },
+      )
+      if (!res.ok) {
+        const err = await res
+          .json()
+          .catch(() => ({ detail: 'Chapter detection failed' }))
+        throw new Error(err.detail || 'Chapter detection failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDetectingChapters(false)
+    }
+  }
+
+  const clearChapters = async () => {
+    if (!result) return
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/chapters`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) {
+        const err = await res
+          .json()
+          .catch(() => ({ detail: 'Clear failed' }))
+        throw new Error(err.detail || 'Clear failed')
+      }
+      setResult(await res.json())
+      setCollapsedChapters(new Set())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const commitChapterRename = async () => {
+    if (!result || !editingChapterId) return
+    const newName = editingChapterName.trim()
+    if (!newName) {
+      setEditingChapterId(null)
+      return
+    }
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/chapters/${editingChapterId}/rename`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: newName }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res
+          .json()
+          .catch(() => ({ detail: 'Rename failed' }))
+        throw new Error(err.detail || 'Rename failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setEditingChapterId(null)
+    }
+  }
+
+  const toggleChapterCollapsed = (chapterId: string) => {
+    setCollapsedChapters((prev) => {
+      const next = new Set(prev)
+      if (next.has(chapterId)) next.delete(chapterId)
+      else next.add(chapterId)
+      return next
+    })
   }
 
   // ── Data fetching ─────────────────────────────────────────────────────
@@ -607,6 +964,8 @@ export function Ingest() {
     setError(null)
     setStatus(null)
     setPreviewSceneId(null)
+    setPreviewChapterId(null)
+    setTranscriptSegments(null)
     clearSelection()
     try {
       const res = await fetch(`/api/video/videos/${id}/scenes`)
@@ -618,6 +977,18 @@ export function Ingest() {
       if (data.scenes.length > 0) {
         setPreviewSceneId(data.scenes[0].scene_id)
       }
+      // Fetch transcript (soft-fail)
+      fetch(`/api/video/videos/${id}/transcript`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((t) => {
+          if (t?.segments) setTranscriptSegments(t.segments)
+        })
+        .catch(() => {})
+      // Fetch valid tags
+      fetch('/api/video/tags')
+        .then((r) => (r.ok ? r.json() : []))
+        .then(setValidTags)
+        .catch(() => {})
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -627,6 +998,8 @@ export function Ingest() {
     setView('list')
     setResult(null)
     setPreviewSceneId(null)
+    setPreviewChapterId(null)
+    setTranscriptSegments(null)
     clearSelection()
     setError(null)
   }
@@ -847,6 +1220,13 @@ export function Ingest() {
                   {pendingMergeCount} pending
                 </span>
               )}
+              {result.chapters && result.chapters.length > 0 && (
+                <span className="text-teal">
+                  {' · '}
+                  {result.chapters.filter((c) => c.type === 'content').length}{' '}
+                  chapters
+                </span>
+              )}
               {' · '}{fmtTime(result.duration)}
               {result.detector && (
                 <>
@@ -862,6 +1242,20 @@ export function Ingest() {
             <Button onClick={applyAllMerges} variant="secondary" size="sm">
               Apply {pendingMergeCount} merge
               {pendingMergeCount === 1 ? '' : 's'}
+            </Button>
+          )}
+          {result.chapters && result.chapters.length > 0 ? (
+            <Button onClick={clearChapters} variant="secondary" size="sm">
+              Clear Chapters
+            </Button>
+          ) : (
+            <Button
+              onClick={runDetectChapters}
+              disabled={detectingChapters}
+              variant="secondary"
+              size="sm"
+            >
+              {detectingChapters ? 'Detecting…' : 'Detect Chapters'}
             </Button>
           )}
         </div>
@@ -896,7 +1290,35 @@ export function Ingest() {
           />
           <span className="text-xs text-text-dim">sec</span>
         </div>
-        {hasDurationFilter && (
+        {chapterBySceneId.size > 0 && (
+          <>
+            <span className="text-xs text-text-muted ml-2">Chapter:</span>
+            <div className="flex items-center gap-0.5 bg-bg3 border border-white/10 rounded overflow-hidden">
+              {(['all', 'content', 'boundary'] as const).map((val) => {
+                const count =
+                  val === 'all'
+                    ? result.chapters?.length ?? 0
+                    : result.chapters?.filter((c) => c.type === val).length ?? 0
+                return (
+                  <button
+                    key={val}
+                    type="button"
+                    onClick={() => setChapterFilter(val)}
+                    className={`px-2 py-1 text-xs capitalize ${
+                      chapterFilter === val
+                        ? 'bg-white/10 text-text-primary'
+                        : 'text-text-dim hover:text-text-muted'
+                    }`}
+                  >
+                    {val}{' '}
+                    <span className="tabular-nums opacity-60">{count}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </>
+        )}
+        {(hasDurationFilter || chapterFilter !== 'all') && (
           <>
             <span className="text-xs text-maize tabular-nums">
               {filteredScenes?.length ?? 0} / {result.scenes.length} scenes
@@ -906,6 +1328,7 @@ export function Ingest() {
               onClick={() => {
                 setDurationMin('')
                 setDurationMax('')
+                setChapterFilter('all')
               }}
               className="text-xs text-text-dim hover:text-text-primary"
             >
@@ -927,114 +1350,237 @@ export function Ingest() {
               const isPending = isMerged && scene.merge_status === 'pending'
               const isCommitted = isMerged && scene.merge_status !== 'pending'
               const firstKf = scene.keyframes[0]
+              const hasBlackSlug = scene.tags?.includes('black_slug')
+
+              // Chapter header: render before the first scene in each chapter
+              const chapter = chapterBySceneId.get(scene.scene_id)
+              const isFirstInChapter =
+                chapter && chapter.scene_ids[0] === scene.scene_id
+              const isCollapsed =
+                chapter && collapsedChapters.has(chapter.chapter_id)
+
+              // If this scene's chapter is collapsed and it's not the first scene, skip
+              if (chapter && !isFirstInChapter && isCollapsed) return null
 
               return (
-                <div
-                  key={scene.scene_id}
-                  className={`flex items-center gap-2 px-2 py-1.5 rounded-md text-xs cursor-pointer transition-colors ${
-                    isPreviewing
-                      ? 'bg-white/8 ring-1 ring-maize/40'
-                      : 'hover:bg-white/4'
-                  } ${isSelected ? 'ring-1 ring-maize/60' : ''}`}
-                  onClick={() => setPreviewSceneId(scene.scene_id)}
-                >
-                  {/* Checkbox */}
-                  <input
-                    type="checkbox"
-                    checked={isSelected}
-                    onChange={() => {
-                      /* handled by onClick */
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      handleSelectScene(scene.scene_id, e.shiftKey)
-                    }}
-                    className="accent-maize cursor-pointer shrink-0"
-                    title="Select (shift-click for range)"
-                  />
-
-                  {/* Thumbnail */}
-                  {firstKf ? (
-                    <img
-                      src={keyframeUrl(result.video_id, firstKf)}
-                      alt=""
-                      loading="lazy"
-                      className="w-12 h-8 object-cover rounded border border-white/10 bg-black shrink-0"
-                    />
-                  ) : (
-                    <div className="w-12 h-8 rounded border border-white/10 bg-black shrink-0" />
-                  )}
-
-                  {/* Scene info */}
-                  <div className="flex-1 min-w-0 flex items-center gap-2">
-                    {editingSceneId === scene.scene_id ? (
-                      <input
-                        type="text"
-                        value={editingName}
-                        onChange={(e) => setEditingName(e.target.value)}
-                        onBlur={commitRename}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') commitRename()
-                          if (e.key === 'Escape') cancelEditing()
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                        autoFocus
-                        className="font-mono text-text-primary bg-bg3 border border-maize/50 rounded px-1.5 py-0.5 text-xs min-w-0 flex-1 focus:outline-none"
-                      />
-                    ) : (
-                      <span
-                        className="font-mono text-text-primary truncate"
-                        onDoubleClick={(e) => {
-                          e.stopPropagation()
-                          startEditing(scene.scene_id)
-                        }}
-                        title="Double-click to rename"
-                      >
-                        {scene.scene_id}
+                <div key={scene.scene_id}>
+                  {/* Chapter header */}
+                  {isFirstInChapter && chapter && (
+                    <div
+                      className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
+                        previewChapterId === chapter.chapter_id
+                          ? 'ring-1 ring-maize/40 '
+                          : ''
+                      }${
+                        chapter.type === 'boundary'
+                          ? 'border-white/5 bg-white/[0.02] hover:bg-white/[0.04]'
+                          : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.06]'
+                      }`}
+                      onClick={() => {
+                        toggleChapterCollapsed(chapter.chapter_id)
+                        setPreviewChapterId(chapter.chapter_id)
+                        setPreviewSceneId(null)
+                      }}
+                    >
+                      <span className="text-text-dim text-[10px] leading-none shrink-0 w-4 text-center">
+                        {isCollapsed ? '▸' : '▾'}
                       </span>
-                    )}
-                    {isMerged && (
+                      {editingChapterId === chapter.chapter_id ? (
+                        <input
+                          type="text"
+                          value={editingChapterName}
+                          onChange={(e) =>
+                            setEditingChapterName(e.target.value)
+                          }
+                          onBlur={commitChapterRename}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitChapterRename()
+                            if (e.key === 'Escape')
+                              setEditingChapterId(null)
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          autoFocus
+                          className="text-text-primary bg-bg3 border border-maize/50 rounded px-1.5 py-0.5 text-xs min-w-0 flex-1 focus:outline-none"
+                        />
+                      ) : (
+                        <span
+                          className="text-xs font-medium text-text-primary truncate flex-1 cursor-text"
+                          onDoubleClick={(e) => {
+                            e.stopPropagation()
+                            setEditingChapterId(chapter.chapter_id)
+                            setEditingChapterName(chapter.name)
+                          }}
+                          title="Double-click to rename"
+                        >
+                          {chapter.name}
+                        </span>
+                      )}
+                      <span className="text-[10px] text-text-dim font-mono shrink-0">
+                        {chapter.chapter_id.split('_').pop()}
+                      </span>
                       <span
                         className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
-                          isCommitted
-                            ? 'bg-teal/15 text-teal'
-                            : 'bg-maize/15 text-maize'
+                          chapter.type === 'boundary'
+                            ? 'bg-white/5 text-text-dim'
+                            : 'bg-teal/10 text-teal'
                         }`}
-                        title={
-                          isCommitted
-                            ? 'Committed — re-run scene detection to reset'
-                            : 'Pending — click ✕ to undo'
-                        }
                       >
-                        {isCommitted ? 'merged' : 'pending'} ×
-                        {scene.merged_from!.length}
+                        {chapter.type}
                       </span>
-                    )}
-                  </div>
+                      <span className="text-[10px] text-text-dim shrink-0 tabular-nums">
+                        {chapter.scene_ids.length} scene
+                        {chapter.scene_ids.length === 1 ? '' : 's'}
+                        {' · '}
+                        {fmtTime(chapter.start)}→{fmtTime(chapter.end)}
+                      </span>
+                    </div>
+                  )}
 
-                  {/* Time + keyframes */}
-                  <span className="text-text-muted shrink-0 tabular-nums">
-                    {fmtTime(scene.start)}→{fmtTime(scene.end)}
-                  </span>
-                  <span className="text-text-dim shrink-0 w-8 text-right tabular-nums">
-                    {scene.duration != null
-                      ? `${scene.duration.toFixed(0)}s`
-                      : ''}
-                  </span>
-
-                  {/* Unmerge button */}
-                  {isPending && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        unmergeGroup(scene.scene_id)
+                  {/* Scene row (skip if collapsed) */}
+                  {!isCollapsed && (
+                    <div
+                      className={`flex items-center gap-2 px-2 py-1.5 rounded-md text-xs cursor-pointer transition-colors ${
+                        isPreviewing
+                          ? 'bg-white/8 ring-1 ring-maize/40'
+                          : 'hover:bg-white/4'
+                      } ${isSelected ? 'ring-1 ring-maize/60' : ''}`}
+                      onClick={() => {
+                        setPreviewSceneId(scene.scene_id)
+                        setPreviewChapterId(null)
                       }}
-                      className="shrink-0 text-text-dim hover:text-coral px-1 text-sm leading-none"
-                      title="Unmerge"
                     >
-                      ✕
-                    </button>
+                      {/* Checkbox */}
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => {
+                          /* handled by onClick */
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleSelectScene(scene.scene_id, e.shiftKey)
+                        }}
+                        className="accent-maize cursor-pointer shrink-0"
+                        title="Select (shift-click for range)"
+                      />
+
+                      {/* Thumbnail */}
+                      {firstKf ? (
+                        <img
+                          src={keyframeUrl(result.video_id, firstKf)}
+                          alt=""
+                          loading="lazy"
+                          className="w-12 h-8 object-cover rounded border border-white/10 bg-black shrink-0"
+                        />
+                      ) : (
+                        <div className="w-12 h-8 rounded border border-white/10 bg-black shrink-0" />
+                      )}
+
+                      {/* Scene info */}
+                      <div className="flex-1 min-w-0 flex items-center gap-2">
+                        {editingSceneId === scene.scene_id ? (
+                          <input
+                            type="text"
+                            value={editingName}
+                            onChange={(e) => setEditingName(e.target.value)}
+                            onBlur={commitRename}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') commitRename()
+                              if (e.key === 'Escape') cancelEditing()
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                            autoFocus
+                            className="font-mono text-text-primary bg-bg3 border border-maize/50 rounded px-1.5 py-0.5 text-xs min-w-0 flex-1 focus:outline-none"
+                          />
+                        ) : (
+                          <span
+                            className="font-mono text-text-primary truncate"
+                            onDoubleClick={(e) => {
+                              e.stopPropagation()
+                              startEditing(scene.scene_id)
+                            }}
+                            title="Double-click to rename"
+                          >
+                            {scene.scene_id}
+                          </span>
+                        )}
+                        {isMerged && (
+                          <span
+                            className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
+                              isCommitted
+                                ? 'bg-teal/15 text-teal'
+                                : 'bg-maize/15 text-maize'
+                            }`}
+                            title={
+                              isCommitted
+                                ? 'Committed — re-run scene detection to reset'
+                                : 'Pending — click ✕ to undo'
+                            }
+                          >
+                            {isCommitted ? 'merged' : 'pending'} ×
+                            {scene.merged_from!.length}
+                          </span>
+                        )}
+                        {hasBlackSlug && (
+                          <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-white/5 text-text-dim">
+                            black slug
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Time + duration */}
+                      {editingTimeSceneId === scene.scene_id ? (
+                        <input
+                          type="text"
+                          value={editingTimeValue}
+                          onChange={(e) => setEditingTimeValue(e.target.value)}
+                          onBlur={commitTimeRange}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitTimeRange()
+                            if (e.key === 'Escape')
+                              setEditingTimeSceneId(null)
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          autoFocus
+                          className="shrink-0 w-28 bg-bg3 border border-maize/50 rounded px-1.5 py-0.5 text-xs text-text-primary font-mono tabular-nums focus:outline-none"
+                        />
+                      ) : (
+                        <span
+                          className="text-text-muted shrink-0 tabular-nums cursor-text"
+                          onDoubleClick={(e) => {
+                            e.stopPropagation()
+                            startEditingTime(
+                              scene.scene_id,
+                              scene.start,
+                              scene.end,
+                            )
+                          }}
+                          title="Double-click to edit time range"
+                        >
+                          {fmtTime(scene.start)}→{fmtTime(scene.end)}
+                        </span>
+                      )}
+                      <span className="text-text-dim shrink-0 w-8 text-right tabular-nums">
+                        {scene.duration != null
+                          ? `${scene.duration.toFixed(0)}s`
+                          : ''}
+                      </span>
+
+                      {/* Unmerge button */}
+                      {isPending && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            unmergeGroup(scene.scene_id)
+                          }}
+                          className="shrink-0 text-text-dim hover:text-coral px-1 text-sm leading-none"
+                          title="Unmerge"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               )
@@ -1085,7 +1631,131 @@ export function Ingest() {
 
         {/* Right: Preview panel */}
         <div className="w-[45%] shrink-0 flex flex-col min-h-0">
-          {previewScene ? (
+          {previewChapter ? (() => {
+            // Chapter preview mode
+            const chScenes = previewChapter.scene_ids
+              .map((sid) => result.scenes.find((s) => s.scene_id === sid))
+              .filter(Boolean) as Scene[]
+            const allKeyframes = chScenes
+              .flatMap((s) => s.keyframes)
+              .sort((a, b) => a.timestamp - b.timestamp)
+            // Check contiguity
+            const sceneIds = result.scenes.map((s) => s.scene_id)
+            const positions = previewChapter.scene_ids
+              .map((sid) => sceneIds.indexOf(sid))
+              .filter((i) => i !== -1)
+              .sort((a, b) => a - b)
+            const isContiguous =
+              positions.length > 0 &&
+              positions[positions.length - 1] - positions[0] === positions.length - 1
+            const chDuration = previewChapter.end - previewChapter.start
+
+            return (
+              <div className="flex-1 overflow-y-auto space-y-4 bg-bg3/50 rounded-lg p-4 border border-white/5">
+                {videoUrl ? (
+                  <ScenePlayer
+                    key={`ch-${previewChapter.chapter_id}`}
+                    src={videoUrl}
+                    sceneStart={previewChapter.start}
+                    sceneEnd={previewChapter.end}
+                    transcriptSegments={transcriptSegments}
+                  />
+                ) : (
+                  <div className="w-full aspect-video rounded border border-white/10 bg-black flex items-center justify-center">
+                    <p className="text-[11px] text-text-dim italic">
+                      Source video not under public/ — preview unavailable.
+                    </p>
+                  </div>
+                )}
+
+                <div className="space-y-1">
+                  <h3 className="text-sm font-medium text-text-primary">
+                    {previewChapter.name}
+                  </h3>
+                  <p className="text-xs text-text-dim">
+                    {fmtTime(previewChapter.start)} → {fmtTime(previewChapter.end)}
+                    <span> · {chDuration.toFixed(1)}s</span>
+                    {' · '}{previewChapter.scene_ids.length} scene
+                    {previewChapter.scene_ids.length === 1 ? '' : 's'}
+                    {' · '}{allKeyframes.length} keyframe
+                    {allKeyframes.length === 1 ? '' : 's'}
+                  </p>
+                  <div className="flex gap-1.5 flex-wrap">
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
+                        previewChapter.type === 'boundary'
+                          ? 'bg-white/5 text-text-dim'
+                          : 'bg-teal/10 text-teal'
+                      }`}
+                    >
+                      {previewChapter.type}
+                    </span>
+                    {!isContiguous && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-coral/15 text-coral">
+                        non-contiguous
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Transcript toggle + editor */}
+                {transcriptSegments && (
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => setShowTranscript((v) => !v)}
+                      className={`text-xs px-2 py-1 rounded border ${
+                        showTranscript
+                          ? 'border-maize/40 bg-maize/10 text-maize'
+                          : 'border-white/10 text-text-dim hover:text-text-muted'
+                      }`}
+                    >
+                      Transcript
+                    </button>
+                    {showTranscript && (
+                      <div className="mt-2 border-t border-white/5 pt-2">
+                        <TranscriptPanel
+                          segments={transcriptSegments.filter(
+                            (s) =>
+                              s.end > previewChapter.start &&
+                              s.start < previewChapter.end,
+                          )}
+                          videoId={result.video_id}
+                          onUpdate={setTranscriptSegments}
+                          onSeek={(t) => {
+                            const v = document.querySelector('video')
+                            if (v) v.currentTime = t
+                          }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {allKeyframes.length > 0 && (
+                  <div className="grid grid-cols-3 gap-2">
+                    {allKeyframes.map((kf) => (
+                      <figure
+                        key={kf.path}
+                        className="flex flex-col items-center gap-1"
+                      >
+                        <img
+                          src={keyframeUrl(result.video_id, kf)}
+                          alt=""
+                          loading="lazy"
+                          className="w-full rounded border border-white/10 bg-black"
+                        />
+                        <figcaption className="text-[10px] text-text-dim font-mono">
+                          {kf.role ?? `frame ${kf.index}`} ·{' '}
+                          {fmtTime(kf.timestamp)}
+                        </figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })() : previewScene ? (
             <div className="flex-1 overflow-y-auto space-y-4 bg-bg3/50 rounded-lg p-4 border border-white/5">
               {/* Video player */}
               {videoUrl ? (
@@ -1094,6 +1764,8 @@ export function Ingest() {
                   src={videoUrl}
                   sceneStart={previewScene.start}
                   sceneEnd={previewScene.end}
+                  transcriptSegments={transcriptSegments}
+                  onTimeUpdate={setCurrentPlaybackTime}
                 />
               ) : (
                 <div className="w-full aspect-video rounded border border-white/10 bg-black flex items-center justify-center">
@@ -1121,7 +1793,209 @@ export function Ingest() {
                     </span>
                   )}
                 </p>
+                {/* Tags (editable) */}
+                <div className="flex gap-1.5 flex-wrap items-center">
+                  {(previewScene.tags ?? []).map((tag) => (
+                    <span
+                      key={tag}
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-white/5 text-text-dim group/tag"
+                    >
+                      {tag.replace(/_/g, ' ')}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const newTags = (previewScene.tags ?? []).filter(
+                            (t) => t !== tag,
+                          )
+                          try {
+                            const res = await fetch(
+                              `/api/video/videos/${result.video_id}/scenes/tags`,
+                              {
+                                method: 'PATCH',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                  scene_id: previewScene.scene_id,
+                                  tags: newTags,
+                                }),
+                              },
+                            )
+                            if (res.ok) setResult(await res.json())
+                          } catch {}
+                        }}
+                        className="text-text-dim hover:text-coral text-[9px] leading-none opacity-0 group-hover/tag:opacity-100 transition-opacity"
+                        title="Remove tag"
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                  {(() => {
+                    const existing = previewScene.tags ?? []
+                    const available = validTags.filter(
+                      (t) => !existing.includes(t),
+                    )
+                    if (available.length === 0) return null
+                    return (
+                      <select
+                        value=""
+                        onChange={async (e) => {
+                          const val = e.target.value
+                          if (!val) return
+                          try {
+                            const res = await fetch(
+                              `/api/video/videos/${result.video_id}/scenes/tags`,
+                              {
+                                method: 'PATCH',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                  scene_id: previewScene.scene_id,
+                                  tags: [...existing, val],
+                                }),
+                              },
+                            )
+                            if (res.ok) setResult(await res.json())
+                          } catch {}
+                        }}
+                        className="bg-bg3 border border-white/10 rounded text-[10px] text-text-dim px-1 py-0.5 focus:border-maize/50 focus:outline-none cursor-pointer"
+                      >
+                        <option value="">+ tag</option>
+                        {available.map((t) => (
+                          <option key={t} value={t}>
+                            {t.replace(/_/g, ' ')}
+                          </option>
+                        ))}
+                      </select>
+                    )
+                  })()}
+                </div>
+                {/* Chapter info */}
+                {(() => {
+                  const ch = chapterBySceneId.get(previewScene.scene_id)
+                  if (!ch) return null
+                  return (
+                    <p className="text-xs text-text-dim">
+                      {ch.name}
+                      <span className={ch.type === 'boundary' ? 'text-text-dim' : 'text-teal'}>
+                        {' · '}{ch.type}
+                      </span>
+                    </p>
+                  )
+                })()}
               </div>
+
+              {/* Trim buttons */}
+              {currentPlaybackTime != null &&
+                currentPlaybackTime > previewScene.start &&
+                currentPlaybackTime < previewScene.end && (
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setError(null)
+                        try {
+                          const res = await fetch(
+                            `/api/video/videos/${result.video_id}/scenes/trim`,
+                            {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                scene_id: previewScene.scene_id,
+                                trim_point: currentPlaybackTime,
+                                direction: 'keep_before',
+                              }),
+                            },
+                          )
+                          if (!res.ok) {
+                            const err = await res
+                              .json()
+                              .catch(() => ({ detail: 'Trim failed' }))
+                            throw new Error(err.detail || 'Trim failed')
+                          }
+                          setResult(await res.json())
+                        } catch (e) {
+                          setError(
+                            e instanceof Error ? e.message : String(e),
+                          )
+                        }
+                      }}
+                      className="text-xs px-2 py-1 rounded border border-white/10 text-text-dim hover:text-text-muted hover:border-white/20"
+                    >
+                      Trim to here ({fmtTime(currentPlaybackTime)})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setError(null)
+                        try {
+                          const res = await fetch(
+                            `/api/video/videos/${result.video_id}/scenes/trim`,
+                            {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                scene_id: previewScene.scene_id,
+                                trim_point: currentPlaybackTime,
+                                direction: 'keep_after',
+                              }),
+                            },
+                          )
+                          if (!res.ok) {
+                            const err = await res
+                              .json()
+                              .catch(() => ({ detail: 'Trim failed' }))
+                            throw new Error(err.detail || 'Trim failed')
+                          }
+                          setResult(await res.json())
+                        } catch (e) {
+                          setError(
+                            e instanceof Error ? e.message : String(e),
+                          )
+                        }
+                      }}
+                      className="text-xs px-2 py-1 rounded border border-white/10 text-text-dim hover:text-text-muted hover:border-white/20"
+                    >
+                      Trim from here ({fmtTime(currentPlaybackTime)})
+                    </button>
+                  </div>
+                )}
+
+              {/* Transcript toggle + editor */}
+              {transcriptSegments && (
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowTranscript((v) => !v)}
+                    className={`text-xs px-2 py-1 rounded border ${
+                      showTranscript
+                        ? 'border-maize/40 bg-maize/10 text-maize'
+                        : 'border-white/10 text-text-dim hover:text-text-muted'
+                    }`}
+                  >
+                    Transcript
+                  </button>
+                  {showTranscript && (
+                    <div className="mt-2 border-t border-white/5 pt-2">
+                      <TranscriptPanel
+                        segments={transcriptSegments.filter(
+                          (s) =>
+                            s.end > previewScene.start &&
+                            s.start < previewScene.end,
+                        )}
+                        videoId={result.video_id}
+                        onUpdate={setTranscriptSegments}
+                        onSeek={(t) => {
+                          const v = document.querySelector('video')
+                          if (v) v.currentTime = t
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Keyframes grid */}
               {previewScene.keyframes.length > 0 && (
@@ -1163,7 +2037,7 @@ export function Ingest() {
           ) : (
             <div className="flex-1 flex items-center justify-center bg-bg3/50 rounded-lg border border-white/5">
               <p className="text-sm text-text-dim">
-                Click a scene to preview
+                Click a scene or chapter to preview
               </p>
             </div>
           )}

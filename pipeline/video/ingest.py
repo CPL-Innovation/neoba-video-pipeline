@@ -39,12 +39,13 @@ class Keyframe(TypedDict):
     role: str
 
 
-class Scene(TypedDict):
+class Scene(TypedDict, total=False):
     scene_id: str
     start: float
     end: float
     duration: float
     keyframes: list[Keyframe]
+    tags: list[str]
 
 
 class IngestResult(TypedDict):
@@ -659,6 +660,7 @@ def run_ingest(
                 "end": round(end, 3),
                 "duration": round(end - start, 3),
                 "keyframes": scene_keyframes,
+                "tags": [],
             }
         )
 

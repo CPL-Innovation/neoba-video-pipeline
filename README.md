@@ -79,10 +79,30 @@ Key design points:
 - Contiguity validation: only adjacent scenes in the raw scene list can be merged
 - v1→v2 migration: old sidecars without status fields default to "committed"
 
-**Scene editing** (`pipeline/video/ingest.py`)
+**Scene editing** (`pipeline/video/ingest.py`, `pipeline/video/router.py`)
 
 - **Inline rename**: Double-click a scene name in the UI to rename it. Updates `scenes.json` and `merges.json` references.
 - **Keyframe deletion**: Remove unwanted keyframes from scenes (useful after merging). Deletes both the JSON entry and the image file on disk. The last keyframe in a scene cannot be deleted.
+- **Time range editing**: Double-click a scene's time range in the scene list to edit start/end times inline. Changes persist immediately to `scenes.json`.
+- **Scene tagging**: Assign tags to scenes from a configurable valid-tags list (`pipeline/video/tags.json`). Tags appear as badges in the scene list and as a dropdown selector in the preview panel. Tags persist to `scenes.json`.
+- **Scene trimming**: Pause the video at any point inside a scene, then use "Trim to here" (keep beginning) or "Trim from here" (keep end). The adjacent scene automatically absorbs the trimmed portion to maintain continuity — no gaps between scenes.
+
+**Chapter detection** (`pipeline/video/chapters.py`)
+
+Chapters are narrative units made of scenes, detected via black-slug analysis. Black slugs — scenes whose keyframes are nearly all-black — serve as chapter boundaries.
+
+- `detect_black_slugs()` — analyzes already-extracted keyframe JPEGs using OpenCV luminance (threshold 10/255, min duration 0.5s). No video re-scan needed.
+- `build_chapters()` — detects slugs, tags scenes with `black_slug`, groups consecutive non-slug scenes into `content` chapters and slug scenes into `boundary` chapters. Auto-numbers content chapters sequentially ("Chapter 1", "Chapter 2", ...) and names boundary chapters "Boundary".
+- `rename_chapter()` — rename a chapter's display name.
+- `clear_chapters()` — removes chapter grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved.
+- On-demand, not automatic — user triggers detection from the UI after reviewing scenes.
+- Chapters stored directly in `scenes.json` as a top-level `chapters` array with `chapter_id`, `type` (`content`/`boundary`), `name`, `scene_ids`, `start`, `end`. Scene `tags` array is per-scene metadata.
+
+**Transcript editing** (`pipeline/video/router.py`)
+
+- **Inline transcript editor**: Toggle a "Transcript" panel in the scene/chapter preview to view and edit transcript segments overlapping the current time range. Click segment text to edit inline, press Enter to save. Delete segments with ✕. Changes persist immediately to `transcript.json`.
+- **Subtitle overlay**: When `transcript.json` exists, subtitles display automatically on the video player during playback, synced to scene/chapter time bounds. Subtitles update in real-time after transcript edits.
+- **Click-to-seek**: Click a transcript segment's timestamp to jump the video to that position.
 
 **Backend HTTP** (`pipeline/video/router.py`, mounted at `/api/video`)
 - `GET /source-videos` — list videos in `public/data/source/videos/`
@@ -95,6 +115,14 @@ Key design points:
 - `POST /videos/{video_id}/merges/apply` — bake all merges into `scenes.json` (irreversible)
 - `PATCH /videos/{video_id}/scenes/rename` — rename a scene (updates `scenes.json` + `merges.json`)
 - `POST /videos/{video_id}/scenes/delete-keyframe` — remove a keyframe from a scene (JSON entry + image file)
+- `PATCH /videos/{video_id}/scenes/time-range` — update a scene's start/end times
+- `PATCH /videos/{video_id}/scenes/tags` — set scene tags from valid tags list
+- `POST /videos/{video_id}/scenes/trim` — trim a scene at a timestamp, adjacent scene absorbs the trimmed portion
+- `POST /videos/{video_id}/chapters/detect` — detect black slugs and group scenes into chapters
+- `PATCH /videos/{video_id}/chapters/{chapter_id}/rename` — rename a chapter
+- `DELETE /videos/{video_id}/chapters` — clear all chapter grouping data (preserves scene tags)
+- `GET /tags` — list valid scene tags from `pipeline/video/tags.json`
+- `PATCH /videos/{video_id}/transcript/segments` — edit or delete transcript segments
 - `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
 
 **Frontend** (`src/views/VideoPipeline/Ingest/index.tsx`)
@@ -103,9 +131,10 @@ Two-level master-detail navigation:
 
 - **Level 1 — Video list**: Run Ingest form + Ingested Videos list. Click a video to drill in.
 - **Level 2 — Scene browser**: Side-by-side layout with back navigation.
-  - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range, duration, and ✕ unmerge button. Duration filter (min/max seconds) for isolating short segments. Merge action bar at bottom.
-  - **Right panel (45%)**: Scene-scoped video player (custom controls with seek bar, play/pause, and time display mapped to the scene's time range — not the full video duration), scene metadata, and 3-column keyframe grid with hover ✕ buttons for deleting unwanted keyframes.
+  - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and chapter type filter (All/Content/Boundary with counts) for isolating segments. Chapter headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, scene count, and time range. Merge action bar at bottom.
+  - **Right panel (45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), chapter info, trim buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Chapter preview mode shows the full chapter range with all member keyframes and contiguity check.
   - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
+  - Click chapter header → collapse/expand + chapter preview; "Detect Chapters" / "Clear Chapters" button in header
   - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
   - "Apply All Merges" button appears when pending merges exist
 
@@ -129,8 +158,10 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 | Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
 | Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
 | Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json`, merged scenes named after first constituent | Done |
-| Stage 1 scene editing — inline rename (double-click), keyframe deletion (hover ✕, removes JSON entry + image file) | Done |
-| Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, scene-scoped video player, keyframe grid, duration filter, inline rename) | Done |
+| Stage 1 scene editing — inline rename, keyframe deletion, time range editing, scene tagging, scene trimming with adjacent-scene absorption | Done |
+| Stage 1 chapter detection — black-slug-based chapter grouping (content/boundary), chapter rename, clear chapters (preserves tags), chapter type filter with counts | Done |
+| Stage 1 transcript integration — subtitle overlay on video player, toggleable inline transcript editor with edit/delete, click-to-seek timestamps | Done |
+| Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, scene-scoped video player with subtitles, chapter headers, keyframe grid, duration + chapter filters, inline rename, tag assignment, trim buttons) | Done |
 | Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
 | Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
 | Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |

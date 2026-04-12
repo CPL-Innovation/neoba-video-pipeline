@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from pipeline.video.chapters import (
+    build_chapters,
+    clear_chapters,
+    rename_chapter,
+)
 from pipeline.video.ingest import (
     VIDEO_RUNS_DIR,
     apply_all_merges,
@@ -199,13 +205,19 @@ def _merged_scenes_response(video_id: str) -> dict:
         raise HTTPException(404, f"No ingest output for {video_id}")
     merges = load_merges(video_id)
     merged_scenes = apply_merges(result["scenes"], merges)
-    return {
+    response = {
         **result,
         "scenes": merged_scenes,
         "scene_count": len(merged_scenes),
         "raw_scene_count": result["scene_count"],
         "merge_groups": merges["groups"],
     }
+    # Pass through chapter data if present
+    if "chapters" in result:
+        response["chapters"] = result["chapters"]  # type: ignore[index]
+    if "chapter_detector" in result:
+        response["chapter_detector"] = result["chapter_detector"]  # type: ignore[index]
+    return response
 
 
 @router.get("/videos/{video_id}/scenes")
@@ -316,6 +328,142 @@ async def rename_scene_endpoint(video_id: str, req: RenameRequest):
     return _merged_scenes_response(video_id)
 
 
+class TimeRangeRequest(BaseModel):
+    scene_id: str
+    start: float
+    end: float
+
+
+@router.patch("/videos/{video_id}/scenes/time-range")
+async def update_scene_time_range(video_id: str, req: TimeRangeRequest):
+    """Update a scene's start/end times in scenes.json."""
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+
+    scene = next(
+        (s for s in result["scenes"] if s["scene_id"] == req.scene_id), None
+    )
+    if scene is None:
+        raise HTTPException(400, f"Unknown scene_id: {req.scene_id}")
+    if req.start >= req.end:
+        raise HTTPException(400, "start must be less than end")
+
+    scene["start"] = round(req.start, 3)
+    scene["end"] = round(req.end, 3)
+    scene["duration"] = round(req.end - req.start, 3)
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    import json as _json
+
+    with open(run_dir / "scenes.json", "w") as f:
+        _json.dump(result, f, indent=2)
+
+    return _merged_scenes_response(video_id)
+
+
+class TagsRequest(BaseModel):
+    scene_id: str
+    tags: list[str]
+
+
+@router.patch("/videos/{video_id}/scenes/tags")
+async def update_scene_tags(video_id: str, req: TagsRequest):
+    """Set the tags list for a scene in scenes.json."""
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+
+    scene = next(
+        (s for s in result["scenes"] if s["scene_id"] == req.scene_id), None
+    )
+    if scene is None:
+        raise HTTPException(400, f"Unknown scene_id: {req.scene_id}")
+
+    scene["tags"] = req.tags  # type: ignore[typeddict-unknown-key]
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    import json as _json
+
+    with open(run_dir / "scenes.json", "w") as f:
+        _json.dump(result, f, indent=2)
+
+    return _merged_scenes_response(video_id)
+
+
+class TrimRequest(BaseModel):
+    scene_id: str
+    trim_point: float
+    direction: str  # "keep_before" | "keep_after"
+
+
+@router.post("/videos/{video_id}/scenes/trim")
+async def trim_scene(video_id: str, req: TrimRequest):
+    """Trim a scene at a given timestamp.
+
+    keep_before: scene keeps [start, trim_point], next scene absorbs the rest.
+    keep_after:  scene keeps [trim_point, end], prev scene absorbs the rest.
+    """
+    import json as _json
+
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+
+    scenes = result["scenes"]
+    idx = next(
+        (i for i, s in enumerate(scenes) if s["scene_id"] == req.scene_id),
+        None,
+    )
+    if idx is None:
+        raise HTTPException(400, f"Unknown scene_id: {req.scene_id}")
+
+    scene = scenes[idx]
+    if req.trim_point <= scene["start"] or req.trim_point >= scene["end"]:
+        raise HTTPException(
+            400, "trim_point must be strictly between scene start and end"
+        )
+
+    tp = round(req.trim_point, 3)
+
+    if req.direction == "keep_before":
+        scene["end"] = tp
+        scene["duration"] = round(tp - scene["start"], 3)
+        if idx + 1 < len(scenes):
+            nxt = scenes[idx + 1]
+            nxt["start"] = tp
+            nxt["duration"] = round(nxt["end"] - tp, 3)
+    elif req.direction == "keep_after":
+        scene["start"] = tp
+        scene["duration"] = round(scene["end"] - tp, 3)
+        if idx - 1 >= 0:
+            prev = scenes[idx - 1]
+            prev["end"] = tp
+            prev["duration"] = round(tp - prev["start"], 3)
+    else:
+        raise HTTPException(400, "direction must be keep_before or keep_after")
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        _json.dump(result, f, indent=2)
+
+    return _merged_scenes_response(video_id)
+
+
+_TAGS_FILE = Path(__file__).resolve().parent / "tags.json"
+
+
+@router.get("/tags")
+async def get_valid_tags():
+    """Return the list of valid scene tags from tags.json."""
+    import json as _json
+
+    if not _TAGS_FILE.exists():
+        return []
+    with open(_TAGS_FILE) as f:
+        return _json.load(f)
+
+
 @router.post("/transcribe")
 async def transcribe_video(req: TranscribeRequest):
     """Kick off Stage 2 mlx-whisper transcription in a background thread.
@@ -409,6 +557,54 @@ async def get_transcript(video_id: str):
     return result
 
 
+class SegmentUpdate(BaseModel):
+    id: int
+    text: str
+
+
+class TranscriptEditRequest(BaseModel):
+    updates: list[SegmentUpdate] = []
+    deletions: list[int] = []
+
+
+@router.patch("/videos/{video_id}/transcript/segments")
+async def edit_transcript_segments(video_id: str, req: TranscriptEditRequest):
+    """Edit transcript segments in place.
+
+    Updates change the text of segments matching by id. Deletions remove
+    segments by id. Writes the result back to transcript.json and returns
+    the updated segments array.
+    """
+    import json as _json
+
+    t_path = transcript_path_for(VIDEO_RUNS_DIR / video_id)
+    if not t_path.exists():
+        raise HTTPException(404, f"No transcript for {video_id}")
+
+    with open(t_path) as f:
+        transcript = _json.load(f)
+
+    segments: list[dict] = transcript.get("segments", [])
+
+    # Apply updates
+    update_map = {u.id: u.text for u in req.updates}
+    for seg in segments:
+        if seg["id"] in update_map:
+            seg["text"] = update_map[seg["id"]]
+
+    # Apply deletions
+    delete_set = set(req.deletions)
+    if delete_set:
+        segments = [s for s in segments if s["id"] not in delete_set]
+
+    transcript["segments"] = segments
+
+    with open(t_path, "w") as f:
+        _json.dump(transcript, f, indent=2)
+
+    return {"segments": segments}
+
+
 @router.post("/transcribe/{video_id}/reclean")
 async def reclean_transcript(video_id: str):
     """Re-apply the cleanup pass to an existing transcript on disk.
@@ -470,3 +666,57 @@ async def get_keyframe(video_id: str, filename: str):
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=3600"},
     )
+
+
+# ── Chapter detection ───────────────────────────────────────────────────
+
+
+class ChapterDetectRequest(BaseModel):
+    luminance_threshold: float = 10
+    min_duration: float = 1.0
+
+
+class ChapterRenameRequest(BaseModel):
+    name: str
+
+
+@router.post("/videos/{video_id}/chapters/detect")
+async def detect_chapters(video_id: str, req: ChapterDetectRequest):
+    """Detect black slugs and group scenes into chapters."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        build_chapters(
+            video_id,
+            luminance_threshold=req.luminance_threshold,
+            min_duration=req.min_duration,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.patch("/videos/{video_id}/chapters/{chapter_id}/rename")
+async def rename_chapter_endpoint(
+    video_id: str, chapter_id: str, req: ChapterRenameRequest
+):
+    """Rename a chapter."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        rename_chapter(video_id, chapter_id, req.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.delete("/videos/{video_id}/chapters")
+async def clear_chapters_endpoint(video_id: str):
+    """Remove all chapter data."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        clear_chapters(video_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)

@@ -35,6 +35,7 @@ interface VlmAnalysis {
 
 interface Segment {
   segment_id: string
+  segment_index?: number
   type: 'content' | 'boundary'
   name: string
   item_id?: string | null
@@ -98,44 +99,38 @@ interface IngestResult {
   segment_detector?: { luminance_threshold: number; min_duration: number }
 }
 
-interface VideoSummary {
+interface VideoListEntry {
+  name: string | null
+  relative_path: string | null
+  size_bytes: number | null
   video_id: string
-  source_path?: string
-  status?: string
-  scene_count?: number
-  created_at?: string
+  has_scenes: boolean
+  scene_count: number | null
+  has_transcript: boolean
+  transcript_segment_count: number | null
 }
 
-interface SourceVideo {
-  name: string
-  relative_path: string
-  size_bytes: number
-}
-
-interface IngestStatus {
+interface PipelineStatus {
   status: 'running' | 'completed' | 'failed'
-  phase:
-    | 'queued'
-    | 'probing'
-    | 'extracting_audio'
-    | 'detecting'
-    | 'extracting'
-    | 'completed'
-    | 'failed'
+  phase: string
+  run_scenes?: boolean
+  run_transcribe?: boolean
   scenes_done?: number
   scenes_total?: number
   scene_count?: number
   duration?: number
+  transcript_segments?: number
   error?: string | null
-  audio_error?: string | null
 }
 
-const PHASE_LABEL: Record<IngestStatus['phase'], string> = {
+const PIPELINE_PHASE_LABEL: Record<string, string> = {
   queued: 'Queued',
   probing: 'Probing duration (ffprobe)',
   extracting_audio: 'Extracting audio track (ffmpeg)',
   detecting: 'Detecting scene boundaries (PySceneDetect)',
   extracting: 'Extracting keyframes (ffmpeg)',
+  transcribing: 'Transcribing audio (mlx-whisper)',
+  cleanup: 'Cleaning transcript',
   completed: 'Completed',
   failed: 'Failed',
 }
@@ -478,13 +473,14 @@ export function Ingest() {
   const [view, setView] = useState<'list' | 'scenes'>('list')
 
   // Level 1 state
-  const [sourceVideos, setSourceVideos] = useState<SourceVideo[]>([])
-  const [sourcePath, setSourcePath] = useState('')
-  const [videoId, setVideoId] = useState('')
-  const [status, setStatus] = useState<IngestStatus | null>(null)
+  const [videoList, setVideoList] = useState<VideoListEntry[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [videos, setVideos] = useState<VideoSummary[]>([])
+  const [pipelineStatus, setPipelineStatus] = useState<Record<string, PipelineStatus>>({})
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [expandedVideoId, setExpandedVideoId] = useState<string | null>(null)
+  const [ingestScenes, setIngestScenes] = useState(true)
+  const [ingestTranscribe, setIngestTranscribe] = useState(true)
+  const [customVideoId, setCustomVideoId] = useState('')
 
   // Level 2 state
   const [result, setResult] = useState<IngestResult | null>(null)
@@ -503,6 +499,8 @@ export function Ingest() {
   )
   const [editingTimeValue, setEditingTimeValue] = useState('')
   const [detectingSegments, setDetectingSegments] = useState(false)
+  const [showDetectModal, setShowDetectModal] = useState(false)
+  const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null)
   const [editingSegmentName, setEditingSegmentName] = useState('')
   const [collapsedSegments, setCollapsedSegments] = useState<Set<string>>(
@@ -523,11 +521,27 @@ export function Ingest() {
   const [vlmPromptSegmentId, setVlmPromptSegmentId] = useState<string | null>(
     null,
   )
-  const [vlmPrompt, setVlmPrompt] = useState(
-    'Analyze this archival video segment. Describe: (1) what is visually happening, (2) any identifiable people, locations, or text on screen, (3) the apparent era and production style, (4) the type of content (interview, b-roll, news report, etc.).',
-  )
+  const DEFAULT_VLM_PROMPT =
+    'Analyze this archival video segment. Describe: (1) what is visually happening, (2) any identifiable people, locations, or text on screen, (3) the apparent era and production style, (4) the type of content (interview, b-roll, news report, etc.).'
+  const [vlmDefaultPrompt, setVlmDefaultPrompt] = useState(DEFAULT_VLM_PROMPT)
+  const [vlmPromptOverrides, setVlmPromptOverrides] = useState<
+    Record<string, string>
+  >({})
+  const [showVlmSettings, setShowVlmSettings] = useState(false)
+  const [vlmSettingsDraft, setVlmSettingsDraft] = useState('')
+  // Active prompt for the currently-open segment editor
+  const vlmPrompt =
+    vlmPromptSegmentId && vlmPromptOverrides[vlmPromptSegmentId] != null
+      ? vlmPromptOverrides[vlmPromptSegmentId]
+      : vlmDefaultPrompt
+  const setVlmPrompt = (text: string) => {
+    if (!vlmPromptSegmentId) return
+    setVlmPromptOverrides((prev) => ({ ...prev, [vlmPromptSegmentId]: text }))
+  }
   const [vlmRunning, setVlmRunning] = useState<string | null>(null)
   const [showVlmAnalysis, setShowVlmAnalysis] = useState(false)
+  const [showVlmFullPrompt, setShowVlmFullPrompt] = useState(false)
+  const [includeCatalogContext, setIncludeCatalogContext] = useState(true)
   const [showCatalog, setShowCatalog] = useState(false)
   const [catalogItems, setCatalogItems] = useState<(SourceItem & { item_id: string; classification?: ClassifiedItem })[]>([])
   const [catalogLoading, setCatalogLoading] = useState(false)
@@ -541,7 +555,7 @@ export function Ingest() {
   const fullVideoRef = useRef<HTMLVideoElement>(null)
   const [fullVideoTime, setFullVideoTime] = useState(0)
 
-  const isRunning = status?.status === 'running'
+  const isRunning = Object.values(pipelineStatus).some(s => s.status === 'running')
   const previewScene = result?.scenes.find(
     (s) => s.scene_id === previewSceneId,
   )
@@ -878,19 +892,21 @@ export function Ingest() {
 
   // ── Segment actions ───────────────────────────────────────────────────
 
-  const runDetectSegments = async () => {
+  const runDetectSegments = async (method: 'scenes' | 'tags') => {
     if (!result) return
     setDetectingSegments(true)
+    setShowDetectModal(false)
     setError(null)
+    const endpoint =
+      method === 'tags'
+        ? `/api/video/videos/${result.video_id}/segments/detect-from-tags`
+        : `/api/video/videos/${result.video_id}/segments/detect`
     try {
-      const res = await fetch(
-        `/api/video/videos/${result.video_id}/segments/detect`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
-        },
-      )
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
       if (!res.ok) {
         const err = await res
           .json()
@@ -1008,8 +1024,39 @@ export function Ingest() {
     })
   }
 
+  /** Build the full VLM prompt for a segment, appending catalog context if linked. */
+  const buildFullVlmPrompt = (segmentId: string) => {
+    const basePrompt = vlmPromptOverrides[segmentId] ?? vlmDefaultPrompt
+    if (!includeCatalogContext) return basePrompt
+    // Find the segment and its linked catalog item
+    const segment = result?.segments?.find((s) => s.segment_id === segmentId)
+    if (!segment?.item_id) return basePrompt
+    const item = catalogItems.find((c) => c.item_id === segment.item_id)
+    if (!item) return basePrompt
+
+    const parts: string[] = [basePrompt, '', '--- Catalog Context ---']
+    const dateParts: string[] = []
+    if (item.date) dateParts.push(item.date)
+    if (dateParts.length > 0) {
+      parts.push(`This clip is dated ${dateParts.join(', ')}.`)
+    }
+    if (item.description) {
+      parts.push(`Catalog description: "${item.description}"`)
+    }
+    if (item.notes) {
+      parts.push(`Additional notes: "${item.notes}"`)
+    }
+    parts.push(
+      '',
+      'Use this context to identify people, events, and locations more precisely. Note any discrepancies between the catalog description and what you observe.',
+    )
+    return parts.join('\n')
+  }
+
   const runVlmAnalysis = async (segmentId: string) => {
     if (!result) return
+    // Build the full prompt including catalog context
+    const promptToUse = buildFullVlmPrompt(segmentId)
     setVlmRunning(segmentId)
     setVlmPromptSegmentId(null)
     setError(null)
@@ -1020,7 +1067,7 @@ export function Ingest() {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt: vlmPrompt }),
+          body: JSON.stringify({ prompt: promptToUse }),
         },
       )
       if (!res.ok) {
@@ -1058,10 +1105,10 @@ export function Ingest() {
 
   // ── Data fetching ─────────────────────────────────────────────────────
 
-  const refreshVideos = async () => {
+  const refreshVideoList = async () => {
     try {
-      const res = await fetch('/api/video/videos')
-      if (res.ok) setVideos(await res.json())
+      const res = await fetch('/api/video/video-list')
+      if (res.ok) setVideoList(await res.json())
     } catch {
       /* ignore */
     }
@@ -1074,26 +1121,21 @@ export function Ingest() {
     }
   }
 
-  const startPolling = (vid: string) => {
+  const startPipelinePolling = (vid: string) => {
     stopPolling()
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`/api/video/ingest/${vid}/status`)
+        const res = await fetch(`/api/video/ingest-pipeline/${vid}/status`)
         if (!res.ok) return
-        const data: IngestStatus = await res.json()
-        setStatus(data)
+        const data: PipelineStatus = await res.json()
+        setPipelineStatus(prev => ({ ...prev, [vid]: data }))
         if (data.status === 'completed') {
           stopPolling()
-          const scenesRes = await fetch(`/api/video/videos/${vid}/scenes`)
-          if (scenesRes.ok) {
-            setResult(await scenesRes.json())
-            setView('scenes')
-          }
-          refreshVideos()
+          refreshVideoList()
         } else if (data.status === 'failed') {
           stopPolling()
-          setError(data.error || 'Ingest failed')
-          refreshVideos()
+          setError(data.error || 'Pipeline failed')
+          refreshVideoList()
         }
       } catch {
         /* keep polling */
@@ -1102,51 +1144,60 @@ export function Ingest() {
   }
 
   useEffect(() => {
-    refreshVideos()
-    fetch('/api/video/source-videos')
-      .then((r) => (r.ok ? r.json() : []))
-      .then((list: SourceVideo[]) => {
-        setSourceVideos(list)
-        if (list.length > 0) setSourcePath(list[0].relative_path)
+    refreshVideoList()
+    // Load persisted settings (e.g. saved VLM prompt)
+    fetch('/api/settings')
+      .then((r) => r.json())
+      .then((s) => {
+        if (s.vlm_default_prompt) setVlmDefaultPrompt(s.vlm_default_prompt)
       })
-      .catch(() => setSourceVideos([]))
+      .catch(() => {})
     return () => stopPolling()
   }, [])
 
-  const runIngest = async () => {
-    if (!sourcePath.trim()) {
-      setError('Provide a video path.')
+  const runPipeline = async (entry: VideoListEntry) => {
+    setError(null)
+    const runScenes = entry.has_scenes ? false : ingestScenes
+    const runTranscribe = entry.has_transcript ? false : ingestTranscribe
+    if (!runScenes && !runTranscribe) {
+      // Nothing to do — just open the video
+      openVideo(entry.video_id)
       return
     }
-    setError(null)
-    setResult(null)
-    setStatus({ status: 'running', phase: 'queued' })
+    setPipelineStatus(prev => ({
+      ...prev,
+      [entry.video_id]: { status: 'running', phase: 'queued', run_scenes: runScenes, run_transcribe: runTranscribe },
+    }))
     try {
-      const res = await fetch('/api/video/ingest', {
+      const res = await fetch('/api/video/ingest-pipeline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          source_path: sourcePath.trim(),
-          video_id: videoId.trim() || null,
+          source_path: entry.relative_path,
+          video_id: customVideoId.trim() || null,
+          run_scenes: runScenes,
+          run_transcribe: runTranscribe,
         }),
       })
       if (!res.ok) {
-        const err = await res
-          .json()
-          .catch(() => ({ detail: 'Unknown error' }))
-        throw new Error(err.detail || 'Ingest failed')
+        const err = await res.json().catch(() => ({ detail: 'Unknown error' }))
+        throw new Error(err.detail || 'Pipeline failed')
       }
       const { video_id: vid } = await res.json()
-      startPolling(vid)
+      setExpandedVideoId(null)
+      startPipelinePolling(vid)
     } catch (e) {
-      setStatus(null)
+      setPipelineStatus(prev => {
+        const next = { ...prev }
+        delete next[entry.video_id]
+        return next
+      })
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
   const openVideo = async (id: string) => {
     setError(null)
-    setStatus(null)
     setPreviewSceneId(null)
     setPreviewSegmentId(null)
     setTranscriptSegments(null)
@@ -1191,40 +1242,33 @@ export function Ingest() {
     setShowTranscriptView(false)
     clearSelection()
     setError(null)
+    refreshVideoList()
   }
 
-  // ── Render: progress bar ──────────────────────────────────────────────
+  // ── Render: inline progress for video row ─────────────────────────────
 
-  const renderProgress = () => {
-    if (!status) return null
-    const phaseLabel = PHASE_LABEL[status.phase] ?? status.phase
-    const total = status.scenes_total ?? 0
-    const done = status.scenes_done ?? 0
+  const renderRowProgress = (st: PipelineStatus) => {
+    const phaseLabel = PIPELINE_PHASE_LABEL[st.phase] ?? st.phase
+    const total = st.scenes_total ?? 0
+    const done = st.scenes_done ?? 0
     const pct = total > 0 ? Math.round((done / total) * 100) : 0
-    const showBar = status.phase === 'extracting' && total > 0
+    const showBar = st.phase === 'extracting' && total > 0
 
     return (
-      <div className="mt-4 space-y-3">
-        <div className="flex items-center gap-2 text-sm text-text-muted">
-          {status.status === 'running' && (
-            <span className="inline-block w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full animate-spin" />
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-xs text-text-muted">
+          {st.status === 'running' && (
+            <span className="inline-block w-2.5 h-2.5 border-2 border-text-muted border-t-transparent rounded-full animate-spin" />
           )}
           <span>{phaseLabel}</span>
-          {status.duration != null && status.phase !== 'probing' && (
-            <span className="text-text-dim">
-              · {fmtTime(status.duration)} clip
-            </span>
-          )}
         </div>
         {showBar && (
           <div>
-            <div className="flex justify-between text-xs text-text-muted mb-1">
+            <div className="flex justify-between text-[10px] text-text-dim mb-0.5">
               <span>Keyframes</span>
-              <span>
-                {done} / {total} scenes — {pct}%
-              </span>
+              <span>{done}/{total} — {pct}%</span>
             </div>
-            <div className="h-2 bg-bg3 rounded-full overflow-hidden">
+            <div className="h-1.5 bg-bg3 rounded-full overflow-hidden">
               <div
                 className="h-full rounded-full bg-maize transition-all duration-300"
                 style={{ width: `${pct}%` }}
@@ -1232,10 +1276,8 @@ export function Ingest() {
             </div>
           </div>
         )}
-        {status.status === 'completed' && (
-          <p className="text-xs text-teal">
-            {status.scene_count} scenes detected.
-          </p>
+        {st.status === 'completed' && (
+          <p className="text-[10px] text-teal">Done</p>
         )}
       </div>
     )
@@ -1247,128 +1289,183 @@ export function Ingest() {
     return (
       <div>
         <PageHeader
-          title="Ingest & Segment"
-          description="Stage 1 — probe duration (ffprobe), detect scene boundaries (PySceneDetect ContentDetector), extract start/mid/end keyframes per scene (ffmpeg)."
+          title="Ingest"
+          description="Stage 1 — scene detection (PySceneDetect) + transcription (mlx-whisper). Select a video to ingest or view processed results."
         />
 
-        <div className="grid gap-5 lg:grid-cols-2">
-          <Card>
-            <h3 className="text-sm font-medium text-text-primary mb-4">
-              Run Ingest
-            </h3>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-xs text-text-muted mb-1">
-                  Source Video{' '}
-                  <span className="text-text-dim">
-                    (public/data/source/videos/)
-                  </span>
-                </label>
-                {sourceVideos.length > 0 ? (
-                  <select
-                    value={sourcePath}
-                    onChange={(e) => setSourcePath(e.target.value)}
-                    disabled={isRunning}
-                    className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
-                  >
-                    {sourceVideos.map((v) => (
-                      <option key={v.relative_path} value={v.relative_path}>
-                        {v.name} ({fmtBytes(v.size_bytes)})
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    type="text"
-                    value={sourcePath}
-                    onChange={(e) => setSourcePath(e.target.value)}
-                    disabled={isRunning}
-                    placeholder="public/data/source/videos/clip.mp4 or absolute path"
-                    className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
-                  />
-                )}
-                {sourceVideos.length === 0 && (
-                  <p className="text-xs text-text-dim mt-1">
-                    No videos found in public/data/source/videos/. Drop one in
-                    or type any path manually.
-                  </p>
-                )}
-              </div>
+        {error && (
+          <p className="text-xs text-coral break-words mb-3">{error}</p>
+        )}
 
-              <div>
-                <label className="block text-xs text-text-muted mb-1">
-                  Video ID (optional — derived from filename if blank)
-                </label>
-                <input
-                  type="text"
-                  value={videoId}
-                  onChange={(e) => setVideoId(e.target.value)}
-                  disabled={isRunning}
-                  placeholder="neoba_1978_03_14_news"
-                  className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary font-mono"
-                />
-              </div>
+        <Card>
+          {videoList.length === 0 ? (
+            <p className="text-sm text-text-dim">
+              No videos found. Place video files in{' '}
+              <span className="font-mono text-text-muted">public/data/source/videos/</span>{' '}
+              and refresh.
+            </p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-white/8 text-xs text-text-muted uppercase tracking-wider">
+                  <th className="text-left py-2 px-3 font-medium">Video</th>
+                  <th className="text-right py-2 px-3 font-medium w-24">Size</th>
+                  <th className="text-right py-2 px-3 font-medium w-28">Scenes</th>
+                  <th className="text-right py-2 px-3 font-medium w-32">Transcript</th>
+                  <th className="text-right py-2 px-3 font-medium w-44">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {videoList.map((entry) => {
+                  const st = pipelineStatus[entry.video_id]
+                  const isEntryRunning = st?.status === 'running'
+                  const isExpanded = expandedVideoId === entry.video_id
+                  const bothDone = entry.has_scenes && entry.has_transcript
+                  const needsScenes = !entry.has_scenes
+                  const needsTranscript = !entry.has_transcript && entry.has_scenes
 
-              <Button
-                onClick={runIngest}
-                disabled={isRunning}
-                size="lg"
-                className="w-full"
-              >
-                {isRunning ? 'Ingesting…' : 'Run Ingest'}
-              </Button>
-
-              {error && (
-                <p className="text-xs text-coral break-words">{error}</p>
-              )}
-
-              {renderProgress()}
-            </div>
-          </Card>
-
-          <Card>
-            <h3 className="text-sm font-medium text-text-primary mb-4">
-              Ingested Videos
-            </h3>
-            {videos.length === 0 ? (
-              <p className="text-sm text-text-dim">
-                Nothing ingested yet. Run Stage 1 above to create the first
-                entry.
-              </p>
-            ) : (
-              <ul className="space-y-1">
-                {videos.map((v) => (
-                  <li key={v.video_id}>
-                    <button
-                      type="button"
-                      onClick={() => openVideo(v.video_id)}
-                      className="w-full flex items-center justify-between gap-3 px-3 py-2 rounded-md text-sm hover:bg-white/5 transition-colors group"
+                  return (
+                    <tr
+                      key={entry.video_id}
+                      className="border-b border-white/4 hover:bg-white/3 transition-colors"
                     >
-                      <span className="font-mono text-xs text-text-primary group-hover:text-maize truncate">
-                        {v.video_id}
-                      </span>
-                      <span className="text-xs text-text-dim shrink-0 flex items-center gap-2">
-                        {v.scene_count ?? '—'} scenes ·{' '}
-                        <span
-                          className={
-                            v.status === 'completed'
-                              ? 'text-teal'
-                              : 'text-text-dim'
-                          }
-                        >
-                          {v.status ?? 'unknown'}
+                      {/* Video name */}
+                      <td className="py-2.5 px-3">
+                        <span className="font-mono text-xs text-text-primary">
+                          {entry.name ?? entry.video_id}
                         </span>
-                        <span className="text-text-dim opacity-0 group-hover:opacity-100 transition-opacity">
-                          →
-                        </span>
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </Card>
-        </div>
+                        {entry.name && entry.video_id !== entry.name?.replace(/\.[^.]+$/, '') && (
+                          <span className="block text-[10px] text-text-dim font-mono mt-0.5">
+                            id: {entry.video_id}
+                          </span>
+                        )}
+                      </td>
+
+                      {/* Size */}
+                      <td className="py-2.5 px-3 text-right text-xs text-text-dim font-mono tabular-nums">
+                        {entry.size_bytes != null ? fmtBytes(entry.size_bytes) : '—'}
+                      </td>
+
+                      {/* Scenes */}
+                      <td className="py-2.5 px-3 text-right text-xs font-mono tabular-nums">
+                        {entry.has_scenes ? (
+                          <span className="text-teal">{entry.scene_count} scenes</span>
+                        ) : (
+                          <span className="text-text-dim">—</span>
+                        )}
+                      </td>
+
+                      {/* Transcript */}
+                      <td className="py-2.5 px-3 text-right text-xs font-mono tabular-nums">
+                        {entry.has_transcript ? (
+                          <span className="text-teal">{entry.transcript_segment_count} segments</span>
+                        ) : (
+                          <span className="text-text-dim">—</span>
+                        )}
+                      </td>
+
+                      {/* Action */}
+                      <td className="py-2.5 px-3 text-right">
+                        {isEntryRunning ? (
+                          <div className="min-w-[160px]">
+                            {renderRowProgress(st)}
+                          </div>
+                        ) : bothDone ? (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => openVideo(entry.video_id)}
+                          >
+                            View
+                          </Button>
+                        ) : needsTranscript ? (
+                          <Button
+                            size="sm"
+                            onClick={() => {
+                              setIngestScenes(false)
+                              setIngestTranscribe(true)
+                              runPipeline({ ...entry })
+                            }}
+                          >
+                            Transcribe
+                          </Button>
+                        ) : (
+                          <div className="inline-flex flex-col items-end gap-1">
+                            <Button
+                              size="sm"
+                              onClick={() => {
+                                if (isExpanded) {
+                                  runPipeline(entry)
+                                } else {
+                                  setExpandedVideoId(entry.video_id)
+                                  setIngestScenes(true)
+                                  setIngestTranscribe(true)
+                                  setCustomVideoId('')
+                                }
+                              }}
+                            >
+                              Ingest
+                            </Button>
+                            {isExpanded && (
+                              <div className="bg-bg3 border border-white/10 rounded-md p-3 text-left space-y-2 mt-1 w-64">
+                                <label className="flex items-center gap-2 text-xs text-text-muted cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={ingestScenes}
+                                    onChange={(e) => setIngestScenes(e.target.checked)}
+                                    className="accent-maize"
+                                  />
+                                  Scene Detection
+                                </label>
+                                <label className="flex items-center gap-2 text-xs text-text-muted cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={ingestTranscribe}
+                                    onChange={(e) => setIngestTranscribe(e.target.checked)}
+                                    className="accent-maize"
+                                  />
+                                  Transcription
+                                </label>
+                                <div>
+                                  <label className="block text-[10px] text-text-dim mb-1">
+                                    Video ID override (optional)
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={customVideoId}
+                                    onChange={(e) => setCustomVideoId(e.target.value)}
+                                    placeholder={entry.video_id}
+                                    className="w-full bg-bg2 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono"
+                                  />
+                                </div>
+                                <div className="flex gap-2 pt-1">
+                                  <Button
+                                    size="sm"
+                                    onClick={() => runPipeline(entry)}
+                                    disabled={!ingestScenes && !ingestTranscribe}
+                                  >
+                                    Run
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => setExpandedVideoId(null)}
+                                  >
+                                    Cancel
+                                  </Button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </Card>
       </div>
     )
   }
@@ -1434,12 +1531,12 @@ export function Ingest() {
             </Button>
           )}
           {result.segments && result.segments.length > 0 ? (
-            <Button onClick={clearSegments} variant="secondary" size="sm">
+            <Button onClick={() => setShowClearConfirm(true)} variant="secondary" size="sm">
               Clear Segments
             </Button>
           ) : (
             <Button
-              onClick={runDetectSegments}
+              onClick={() => setShowDetectModal(true)}
               disabled={detectingSegments}
               variant="secondary"
               size="sm"
@@ -1463,6 +1560,20 @@ export function Ingest() {
               Transcript ({fullTranscript.segments.length})
             </Button>
           )}
+          <button
+            type="button"
+            onClick={() => {
+              setVlmSettingsDraft(vlmDefaultPrompt)
+              setShowVlmSettings(true)
+            }}
+            className="p-1.5 rounded border border-white/10 text-text-dim hover:text-text-muted hover:border-white/20 transition-colors"
+            title="VLM prompt settings"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
         </div>
       </div>
 
@@ -1825,6 +1936,9 @@ export function Ingest() {
                           }}
                           title="Double-click to rename"
                         >
+                          {segment.segment_index != null && (
+                            <span className="text-text-dim font-mono mr-1">S{segment.segment_index}</span>
+                          )}
                           {segment.name}
                         </span>
                       )}
@@ -1965,6 +2079,15 @@ export function Ingest() {
                               ? 'Analyzing...'
                               : 'Run VLM'}
                           </button>
+                          <label className="flex items-center gap-1 text-[10px] text-text-dim cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={includeCatalogContext}
+                              onChange={(e) => setIncludeCatalogContext(e.target.checked)}
+                              className="accent-violet-500"
+                            />
+                            Include catalog context
+                          </label>
                           <span className="text-[10px] text-text-dim">
                             gemma4:e4b via Ollama
                           </span>
@@ -1976,6 +2099,18 @@ export function Ingest() {
                             Cancel
                           </button>
                         </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowVlmFullPrompt((v) => !v)}
+                          className="text-[10px] text-violet-300/50 hover:text-violet-300 transition-colors"
+                        >
+                          {showVlmFullPrompt ? '▾ Hide full prompt' : '▸ Preview full prompt'}
+                        </button>
+                        {showVlmFullPrompt && (
+                          <pre className="whitespace-pre-wrap text-[10px] text-text-dim bg-bg3 border border-white/5 rounded p-2 max-h-48 overflow-y-auto">
+                            {buildFullVlmPrompt(segment.segment_id)}
+                          </pre>
+                        )}
                       </div>
                     )}
                   </>)}
@@ -2254,6 +2389,9 @@ export function Ingest() {
 
                 <div className="space-y-1">
                   <h3 className="text-sm font-medium text-text-primary">
+                    {previewSegment.segment_index != null && (
+                      <span className="text-text-dim font-mono mr-1.5">S{previewSegment.segment_index}</span>
+                    )}
                     {previewSegment.name}
                   </h3>
                   <p className="text-xs text-text-dim">
@@ -2394,14 +2532,35 @@ export function Ingest() {
                                       ? 'Analyzing...'
                                       : 'Run VLM'}
                                   </button>
+                                  <label className="flex items-center gap-1 text-[10px] text-text-dim cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={includeCatalogContext}
+                                      onChange={(e) => setIncludeCatalogContext(e.target.checked)}
+                                      className="accent-violet-500"
+                                    />
+                                    Include catalog context
+                                  </label>
                                   <button
                                     type="button"
                                     onClick={() => setVlmPromptSegmentId(null)}
-                                    className="text-[10px] text-text-dim hover:text-text-muted"
+                                    className="ml-auto text-[10px] text-text-dim hover:text-text-muted"
                                   >
                                     Cancel
                                   </button>
                                 </div>
+                                <button
+                                  type="button"
+                                  onClick={() => setShowVlmFullPrompt((v) => !v)}
+                                  className="text-[10px] text-violet-300/50 hover:text-violet-300 transition-colors"
+                                >
+                                  {showVlmFullPrompt ? '▾ Hide full prompt' : '▸ Preview full prompt'}
+                                </button>
+                                {showVlmFullPrompt && (
+                                  <pre className="whitespace-pre-wrap text-[10px] text-text-dim bg-bg3 border border-white/5 rounded p-2 max-h-48 overflow-y-auto">
+                                    {buildFullVlmPrompt(previewSegment.segment_id)}
+                                  </pre>
+                                )}
                               </div>
                             )}
                           </>
@@ -2442,6 +2601,15 @@ export function Ingest() {
                                       ? 'Analyzing...'
                                       : 'Run VLM'}
                                   </button>
+                                  <label className="flex items-center gap-1 text-[10px] text-text-dim cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={includeCatalogContext}
+                                      onChange={(e) => setIncludeCatalogContext(e.target.checked)}
+                                      className="accent-violet-500"
+                                    />
+                                    Include catalog context
+                                  </label>
                                   <span className="text-[10px] text-text-dim">
                                     gemma4:e4b via Ollama
                                   </span>
@@ -2453,6 +2621,18 @@ export function Ingest() {
                                     Cancel
                                   </button>
                                 </div>
+                                <button
+                                  type="button"
+                                  onClick={() => setShowVlmFullPrompt((v) => !v)}
+                                  className="text-[10px] text-violet-300/50 hover:text-violet-300 transition-colors"
+                                >
+                                  {showVlmFullPrompt ? '▾ Hide full prompt' : '▸ Preview full prompt'}
+                                </button>
+                                {showVlmFullPrompt && (
+                                  <pre className="whitespace-pre-wrap text-[10px] text-text-dim bg-bg3 border border-white/5 rounded p-2 max-h-48 overflow-y-auto">
+                                    {buildFullVlmPrompt(previewSegment.segment_id)}
+                                  </pre>
+                                )}
                               </div>
                             )}
                           </div>
@@ -2462,27 +2642,53 @@ export function Ingest() {
                   </div>
                 )}
 
-                {allKeyframes.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2">
-                    {allKeyframes.map((kf) => (
-                      <figure
-                        key={kf.path}
-                        className="flex flex-col items-center gap-1"
-                      >
-                        <img
-                          src={keyframeUrl(result.video_id, kf)}
-                          alt=""
-                          loading="lazy"
-                          className="w-full rounded border border-white/10 bg-black"
-                        />
-                        <figcaption className="text-[10px] text-text-dim font-mono">
-                          {kf.role ?? `frame ${kf.index}`} ·{' '}
-                          {fmtTime(kf.timestamp)}
-                        </figcaption>
-                      </figure>
-                    ))}
-                  </div>
-                )}
+                {allKeyframes.length > 0 && (() => {
+                  // Build keyframe→scene lookup for deletion
+                  const kfToScene = new Map<string, { sceneId: string; count: number }>()
+                  for (const s of chScenes) {
+                    for (const kf of s.keyframes) {
+                      kfToScene.set(kf.path, { sceneId: s.scene_id, count: s.keyframes.length })
+                    }
+                  }
+                  return (
+                    <div className="grid grid-cols-3 gap-2">
+                      {allKeyframes.map((kf) => {
+                        const owner = kfToScene.get(kf.path)
+                        return (
+                          <figure
+                            key={kf.path}
+                            className="relative flex flex-col items-center gap-1 group/kf"
+                          >
+                            <div className="relative w-full">
+                              <img
+                                src={keyframeUrl(result.video_id, kf)}
+                                alt=""
+                                loading="lazy"
+                                className="w-full rounded border border-white/10 bg-black"
+                              />
+                              {owner && owner.count > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    deleteKeyframe(owner.sceneId, kf.path)
+                                  }
+                                  className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-text-dim hover:bg-coral hover:text-white flex items-center justify-center text-xs leading-none opacity-0 group-hover/kf:opacity-100 transition-opacity"
+                                  title="Remove keyframe"
+                                >
+                                  ✕
+                                </button>
+                              )}
+                            </div>
+                            <figcaption className="text-[10px] text-text-dim font-mono">
+                              {kf.role ?? `frame ${kf.index}`} ·{' '}
+                              {fmtTime(kf.timestamp)}
+                            </figcaption>
+                          </figure>
+                        )
+                      })}
+                    </div>
+                  )
+                })()}
               </div>
             )
           })() : previewScene ? (
@@ -2773,6 +2979,197 @@ export function Ingest() {
           )}
         </div>
       </div>
+
+      {/* VLM Settings modal */}
+      {showVlmSettings && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowVlmSettings(false)}
+        >
+          <div
+            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-lg p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-medium text-text-primary">
+              Default VLM Prompt
+            </h3>
+            <p className="text-xs text-text-dim">
+              This prompt is used for all VLM segment analysis. Changing it will
+              reset any per-segment prompt edits back to this new default.
+            </p>
+            <textarea
+              value={vlmSettingsDraft}
+              onChange={(e) => setVlmSettingsDraft(e.target.value)}
+              rows={6}
+              className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary resize-y focus:outline-none focus:border-maize/40"
+            />
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => {
+                  setVlmSettingsDraft(DEFAULT_VLM_PROMPT)
+                }}
+                className="text-xs text-text-dim hover:text-text-muted transition-colors"
+              >
+                Reset to built-in default
+              </button>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={!vlmSettingsDraft.trim()}
+                  onClick={() => {
+                    const prompt = vlmSettingsDraft.trim()
+                    fetch('/api/settings', {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ vlm_default_prompt: prompt }),
+                    }).catch(() => {})
+                    setVlmDefaultPrompt(prompt)
+                    setShowVlmSettings(false)
+                  }}
+                  className="px-3 py-1.5 rounded text-xs font-medium text-text-dim hover:text-text-primary border border-white/10 hover:border-white/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  Save as Default
+                </button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowVlmSettings(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={!vlmSettingsDraft.trim()}
+                  onClick={() => {
+                    const newDefault = vlmSettingsDraft.trim()
+                    setVlmDefaultPrompt(newDefault)
+                    setVlmPromptOverrides({}) // reset all per-segment overrides
+                    setShowVlmSettings(false)
+                    // Also persist
+                    fetch('/api/settings', {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ vlm_default_prompt: newDefault }),
+                    }).catch(() => {})
+                  }}
+                >
+                  Apply to All
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Detect Segments modal */}
+      {showDetectModal && (() => {
+        const taggedCount = result.scenes.filter(
+          (s) => (s.tags ?? []).includes('black_slug'),
+        ).length
+        return (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+            onClick={() => setShowDetectModal(false)}
+          >
+            <div
+              className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-md p-5 space-y-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-sm font-medium text-text-primary">
+                Detect Segments
+              </h3>
+              <p className="text-xs text-text-dim">
+                Choose how to identify black slug boundaries:
+              </p>
+
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => runDetectSegments('scenes')}
+                  className="w-full text-left p-3 rounded-md border border-white/10 hover:border-maize/40 hover:bg-white/3 transition-colors group"
+                >
+                  <span className="text-sm text-text-primary group-hover:text-maize">
+                    Detect by scene analysis
+                  </span>
+                  <p className="text-xs text-text-dim mt-1">
+                    Analyze keyframe luminance to find black slugs automatically.
+                    Runs image analysis on all scenes.
+                  </p>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => runDetectSegments('tags')}
+                  disabled={taggedCount === 0}
+                  className="w-full text-left p-3 rounded-md border border-white/10 hover:border-maize/40 hover:bg-white/3 transition-colors group disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-white/10 disabled:hover:bg-transparent"
+                >
+                  <span className="text-sm text-text-primary group-hover:text-maize">
+                    Detect by slug tags
+                  </span>
+                  <p className="text-xs text-text-dim mt-1">
+                    Use existing BLACK SLUG tags as dividers.
+                    {taggedCount > 0
+                      ? ` ${taggedCount} scene${taggedCount === 1 ? '' : 's'} currently tagged.`
+                      : ' No scenes tagged yet — tag scenes first.'}
+                  </p>
+                </button>
+              </div>
+
+              <div className="flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowDetectModal(false)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* Clear Segments confirmation modal */}
+      {showClearConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowClearConfirm(false)}
+        >
+          <div
+            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-sm p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-medium text-text-primary">
+              Clear Segments?
+            </h3>
+            <p className="text-xs text-text-dim">
+              All segment data — groupings, names, linked catalog items, and VLM
+              analyses — will be removed. Scene tags will be preserved. This
+              action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowClearConfirm(false)}
+              >
+                Cancel
+              </Button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowClearConfirm(false)
+                  clearSegments()
+                }}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-red-500/20 text-red-300 hover:bg-red-500/30 transition-colors"
+              >
+                Clear All Segments
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

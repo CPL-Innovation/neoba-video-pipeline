@@ -748,7 +748,21 @@ def list_ingested_videos() -> list[dict]:
         meta_file = d / "metadata.json"
         if meta_file.exists():
             with open(meta_file) as f:
-                out.append(json.load(f))
+                entry = json.load(f)
         else:
-            out.append({"video_id": d.name, "status": "unknown"})
+            entry = {"video_id": d.name, "status": "unknown"}
+        # Enrich with transcript status
+        transcript_file = d / "transcript.json"
+        if transcript_file.exists():
+            entry["has_transcript"] = True
+            try:
+                with open(transcript_file) as f:
+                    t = json.load(f)
+                entry["transcript_segment_count"] = len(t.get("segments", []))
+            except Exception:
+                entry["transcript_segment_count"] = None
+        else:
+            entry["has_transcript"] = False
+            entry["transcript_segment_count"] = None
+        out.append(entry)
     return out

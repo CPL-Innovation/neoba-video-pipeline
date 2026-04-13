@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from pipeline.video.segments import (
     assign_item_to_segment,
     build_segments,
+    build_segments_from_tags,
     clear_segments,
     rename_segment,
 )
@@ -678,8 +679,8 @@ async def get_keyframe(video_id: str, filename: str):
 
 
 class SegmentDetectRequest(BaseModel):
-    luminance_threshold: float = 10
-    min_duration: float = 1.0
+    luminance_threshold: float = 30
+    min_duration: float = 0.5
 
 
 class SegmentAssignItemRequest(BaseModel):
@@ -701,6 +702,18 @@ async def detect_segments(video_id: str, req: SegmentDetectRequest):
             luminance_threshold=req.luminance_threshold,
             min_duration=req.min_duration,
         )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.post("/videos/{video_id}/segments/detect-from-tags")
+async def detect_segments_from_tags(video_id: str):
+    """Build segments using existing black_slug tags as dividers."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        build_segments_from_tags(video_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)
@@ -837,3 +850,213 @@ async def get_vlm_status(video_id: str, segment_id: str):
     if seg and seg.get("vlm_analysis"):
         return {"status": "completed", "video_id": video_id, "segment_id": segment_id}
     raise HTTPException(404, f"No VLM job or result for {segment_id}")
+
+
+# ── Unified video list ─────────────────────────────────────────────────
+
+
+@router.get("/video-list")
+async def get_video_list():
+    """Merged list: all source videos cross-referenced with ingested runs.
+
+    Each entry carries enough info for the frontend to decide which
+    action to offer (Ingest / Transcribe / View).
+    """
+    source_videos = list_source_videos()
+    ingested = list_ingested_videos()
+
+    ingested_map: dict[str, dict] = {v["video_id"]: v for v in ingested}
+
+    # Build a set of video_ids already matched from source files
+    matched_ids: set[str] = set()
+    out: list[dict] = []
+
+    for sv in source_videos:
+        stem = Path(sv["name"]).stem
+        vid = derive_video_id(Path(stem))
+        matched_ids.add(vid)
+        ing = ingested_map.get(vid)
+        entry: dict = {
+            "name": sv["name"],
+            "relative_path": sv["relative_path"],
+            "size_bytes": sv["size_bytes"],
+            "video_id": vid,
+            "has_scenes": False,
+            "scene_count": None,
+            "has_transcript": False,
+            "transcript_segment_count": None,
+        }
+        if ing:
+            entry["has_scenes"] = ing.get("status") == "completed" or (
+                ing.get("scene_count") is not None
+                and ing["scene_count"] > 0
+            )
+            entry["scene_count"] = ing.get("scene_count")
+            entry["has_transcript"] = ing.get("has_transcript", False)
+            entry["transcript_segment_count"] = ing.get(
+                "transcript_segment_count"
+            )
+        out.append(entry)
+
+    # Orphans: ingested videos whose source file no longer exists
+    for vid, ing in ingested_map.items():
+        if vid not in matched_ids:
+            out.append(
+                {
+                    "name": None,
+                    "relative_path": ing.get("source_path"),
+                    "size_bytes": None,
+                    "video_id": vid,
+                    "has_scenes": ing.get("status") == "completed"
+                    or (
+                        ing.get("scene_count") is not None
+                        and ing["scene_count"] > 0
+                    ),
+                    "scene_count": ing.get("scene_count"),
+                    "has_transcript": ing.get("has_transcript", False),
+                    "transcript_segment_count": ing.get(
+                        "transcript_segment_count"
+                    ),
+                }
+            )
+
+    return out
+
+
+# ── Combined ingest pipeline ──────────────────────────────────────────
+
+pipeline_jobs: dict[str, dict[str, Any]] = {}
+_pipeline_lock = threading.Lock()
+
+
+def _set_pipeline_job(video_id: str, **fields: Any) -> None:
+    with _pipeline_lock:
+        job = pipeline_jobs.setdefault(video_id, {})
+        job.update(fields)
+
+
+def _get_pipeline_job(video_id: str) -> dict[str, Any] | None:
+    with _pipeline_lock:
+        job = pipeline_jobs.get(video_id)
+        return dict(job) if job else None
+
+
+class PipelineRequest(BaseModel):
+    source_path: str
+    video_id: str | None = None
+    threshold: float = 27.0
+    run_scenes: bool = True
+    run_transcribe: bool = True
+
+
+@router.post("/ingest-pipeline")
+async def ingest_pipeline(req: PipelineRequest):
+    """Combined ingest: scene detection + transcription in one job.
+
+    Runs the selected steps sequentially in a background thread.
+    Poll GET /api/video/ingest-pipeline/{video_id}/status for progress.
+    """
+    try:
+        src = resolve_source_path(req.source_path)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid path: {e}")
+    if not src.exists():
+        raise HTTPException(404, f"Video not found: {src}")
+
+    vid = derive_video_id(src, req.video_id)
+
+    existing = _get_pipeline_job(vid)
+    if existing and existing.get("status") == "running":
+        raise HTTPException(409, f"Pipeline already running for {vid}")
+
+    _set_pipeline_job(
+        vid,
+        status="running",
+        phase="queued",
+        run_scenes=req.run_scenes,
+        run_transcribe=req.run_transcribe,
+        scenes_done=0,
+        scenes_total=0,
+        duration=None,
+        scene_count=None,
+        error=None,
+        started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+
+    def progress_callback(payload: dict) -> None:
+        _set_pipeline_job(vid, **payload)
+
+    def worker() -> None:
+        try:
+            if req.run_scenes:
+                result = run_ingest(
+                    source_path=src,
+                    video_id=vid,
+                    threshold=req.threshold,
+                    progress_callback=progress_callback,
+                )
+                _set_pipeline_job(
+                    vid,
+                    scene_count=result["scene_count"],
+                    duration=result["duration"],
+                )
+            else:
+                # Scenes already exist — load metadata for duration
+                existing_result = load_ingest_result(vid)
+                if existing_result:
+                    _set_pipeline_job(
+                        vid,
+                        scene_count=existing_result.get("scene_count"),
+                        duration=existing_result.get("duration"),
+                    )
+
+            if req.run_transcribe:
+                _set_pipeline_job(vid, phase="transcribing")
+                t_result = run_transcribe(
+                    video_id=vid,
+                    progress_callback=progress_callback,
+                )
+                _set_pipeline_job(
+                    vid,
+                    phase="cleanup",
+                    transcript_segments=len(
+                        t_result.get("segments", [])
+                    ),
+                )
+
+            _set_pipeline_job(
+                vid,
+                status="completed",
+                phase="completed",
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+        except Exception as e:
+            _set_pipeline_job(
+                vid,
+                status="failed",
+                phase="failed",
+                error=str(e),
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"video_id": vid, "status": "started"}
+
+
+@router.get("/ingest-pipeline/{video_id}/status")
+async def get_pipeline_status(video_id: str):
+    """Poll combined ingest pipeline progress."""
+    job = _get_pipeline_job(video_id)
+    if job is not None:
+        return job
+    # Fall back: check if this video is fully done on disk
+    result = load_ingest_result(video_id)
+    transcript = load_transcript(video_id)
+    if result is None and transcript is None:
+        raise HTTPException(404, f"No pipeline job or output for {video_id}")
+    return {
+        "status": "completed",
+        "phase": "completed",
+        "scene_count": result.get("scene_count") if result else None,
+        "duration": result.get("duration") if result else None,
+    }

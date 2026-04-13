@@ -91,13 +91,14 @@ Key design points:
 
 Segments are narrative units made of scenes, detected via black-slug analysis. Black slugs — scenes whose keyframes are nearly all-black — serve as segment boundaries.
 
-- `detect_black_slugs()` — analyzes already-extracted keyframe JPEGs using OpenCV luminance (threshold 10/255, min duration 0.5s). No video re-scan needed.
-- `build_segments()` — detects slugs, tags scenes with `black_slug`, groups consecutive non-slug scenes into `content` segments and slug scenes into `boundary` segments. Auto-numbers content segments sequentially ("Segment 1", "Segment 2", ...) and names boundary segments "Boundary".
+- `detect_black_slugs()` — analyzes already-extracted keyframe JPEGs using a dual criterion: mean luminance < 30/255 AND standard deviation < 5.0 (to distinguish uniform black from dark-but-textured content like nighttime footage). Min duration 0.5s. No video re-scan needed. Handles "lifted black" tape encodings (e.g. JCU tapes with luminance 14–27).
+- `build_segments()` — detects slugs, tags scenes with `black_slug`, groups consecutive non-slug scenes into `content` segments and slug scenes into `boundary` segments. Auto-numbers content segments sequentially ("Segment 1", "Segment 2", ...) with a `segment_index` field (1, 2, 3, ...) and names boundary segments "Boundary".
+- `build_segments_from_tags()` — alternative detection method that uses existing `black_slug` tags as dividers instead of running luminance analysis. Useful when tags have been manually curated.
 - `rename_segment()` — rename a segment's display name.
 - `assign_item_to_segment()` — link a catalog item to a segment (1:1). Stores `item_id` on the segment object in `scenes.json`.
-- `clear_segments()` — removes segment grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved.
-- On-demand, not automatic — user triggers detection from the UI after reviewing scenes.
-- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `type` (`content`/`boundary`), `name`, `item_id` (optional catalog link), `scene_ids`, `start`, `end`. Scene `tags` array is per-scene metadata.
+- `clear_segments()` — removes segment grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved. Requires user confirmation via modal.
+- On-demand, not automatic — user triggers detection from a modal offering two methods: scene analysis (luminance) or by existing slug tags.
+- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `segment_index`, `type` (`content`/`boundary`), `name`, `item_id` (optional catalog link), `scene_ids`, `start`, `end`. Scene `tags` array is per-scene metadata.
 
 **Transcript editing** (`pipeline/video/router.py`)
 
@@ -112,7 +113,8 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 - `analyze_segment()` — collects keyframes (capped at 6, evenly sampled), transcript text overlapping the segment's time range, and metadata (name, type, duration, scene count). Sends as a multimodal prompt to Ollama and persists the result.
 - `_ollama_chat()` — wraps the Ollama `/api/chat` endpoint with base64 image support. Uses stdlib `urllib` (no extra dependencies).
 - Default model: **Gemma 4 E4B** via Ollama (multimodal, ~9 GB). Configurable per-request.
-- Default prompt is an archival analysis template (visual content, people/locations, era, content type). Fully editable from the UI before each run.
+- Default prompt is an archival analysis template (visual content, people/locations, era, content type). Fully editable from the UI before each run, with a global default (persisted to `data/settings.json`) and per-segment overrides.
+- **Catalog context injection**: When a segment has a linked catalog item, date, description, and additional notes from the item are appended to the VLM prompt automatically. This is controlled by an "Include catalog context" checkbox (checked by default) next to the Run VLM button. A "Preview full prompt" toggle shows the final concatenated prompt before sending.
 - Results stored directly on the segment object in `scenes.json` as `vlm_analysis: { summary, full_analysis, model, prompt, analyzed_at }`.
 - Runs in a background thread (same pattern as ingest/transcribe) with status polling, since inference takes ~1 min per image on Apple Silicon.
 
@@ -130,28 +132,36 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 - `PATCH /videos/{video_id}/scenes/time-range` — update a scene's start/end times
 - `PATCH /videos/{video_id}/scenes/tags` — set scene tags from valid tags list
 - `POST /videos/{video_id}/scenes/trim` — trim a scene at a timestamp, adjacent scene absorbs the trimmed portion
-- `POST /videos/{video_id}/segments/detect` — detect black slugs and group scenes into segments
+- `POST /videos/{video_id}/segments/detect` — detect black slugs via luminance analysis and group scenes into segments
+- `POST /videos/{video_id}/segments/detect-from-tags` — detect segments using existing `black_slug` tags as dividers
 - `PATCH /videos/{video_id}/segments/{segment_id}/rename` — rename a segment
 - `PATCH /videos/{video_id}/segments/{segment_id}/assign-item` — assign a catalog item_id to a segment (or `null` to unassign)
 - `DELETE /videos/{video_id}/segments` — clear all segment grouping data (preserves scene tags)
 - `POST /videos/{video_id}/segments/{segment_id}/analyze` — kick off VLM analysis in background thread, returns `{ status: "started" }`
 - `GET /videos/{video_id}/segments/{segment_id}/analyze/status` — poll VLM job status (`running` → `completed` / `failed`)
+- `GET /video-list` — merged list of all source videos cross-referenced with ingested runs (scene/transcript status per video)
+- `POST /ingest-pipeline` — combined scene detection + transcription in one background thread, with checkboxes to control which steps run
+- `GET /ingest-pipeline/{video_id}/status` — unified progress polling for the combined pipeline
 - `GET /tags` — list valid scene tags from `pipeline/video/tags.json`
 - `PATCH /videos/{video_id}/transcript/segments` — edit or delete transcript segments
 - `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
+
+**Settings API** (mounted at `/api`, in `pipeline/server.py`)
+- `GET /settings` — read persistent user settings from `data/settings.json`
+- `PATCH /settings` — update settings (merge-patch semantics). Currently stores `vlm_default_prompt`.
 
 **Frontend** (`src/views/VideoPipeline/Ingest/index.tsx`)
 
 Two-level master-detail navigation:
 
-- **Level 1 — Video list**: Run Ingest form + Ingested Videos list. Click a video to drill in.
+- **Level 1 — Unified video list**: Single table showing all source videos cross-referenced with ingested runs. Each row shows filename, size, scene count, transcript segment count, and an action button (View if fully ingested, Ingest with checkboxes for scene detection/transcription, or Transcribe if only scenes exist). Inline progress bar during ingest showing phase labels (probing → detecting → extracting → transcribing → completed).
 - **Level 2 — Scene browser**: Three-column layout with back navigation.
   - **Catalog column (20%, toggleable)**: Lists catalog items from `items.json` matching the current video by filename. Each item shows ID, segment assignment badge, description, duration, and classification thread badges. Filter toggle (All/Assigned/Unassigned) for tracking catalog-to-segment linking progress.
   - **Center column (38–55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and segment type filter (All/Content/Boundary with counts) for isolating segments. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, catalog item assignment button, scene count, and time range. Merge action bar at bottom. Toggleable **transcript view** replaces the scene list with full scrollable transcript (cleaned/raw toggle, re-clean, click-to-seek), with Scene/Full Video mode switch.
   - **Right panel (42–45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check. In Full Video transcript mode, shows unclamped video player with live transcript captions overlaid.
   - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
-  - Click segment header → collapse/expand + segment preview; "Detect Segments" / "Clear Segments" button in header; ✦ VLM analyze button on content segments opens inline prompt editor; catalog item assign button on content segments opens dropdown picker
-  - **VLM Analysis panel**: Toggle in segment detail view. Shows full analysis text, model/timestamp metadata, prompt used (collapsible), and re-analyze button. Purple dot indicator on segment bar when analysis exists.
+  - Click segment header → collapse/expand + segment preview; "Detect Segments" opens a modal with two methods (luminance analysis or by existing slug tags); "Clear Segments" requires confirmation modal warning about data loss; ✦ VLM analyze button on content segments opens inline prompt editor; catalog item assign button on content segments opens dropdown picker. Segment headers display "S{index}" prefix (e.g. "S1 Segment 1").
+  - **VLM Analysis panel**: Toggle in segment detail view. Shows full analysis text, model/timestamp metadata, prompt used (collapsible), and re-analyze button. Purple dot indicator on segment bar when analysis exists. "Include catalog context" checkbox controls whether linked catalog item metadata is appended to the prompt. "Preview full prompt" toggle shows the final prompt including any catalog context. VLM prompt settings gear icon opens a modal to edit the global default prompt, with "Save as Default" (persists to disk) and "Apply to All" (also resets per-segment overrides).
   - **Catalog item assignment**: 1:1 link between content segments and catalog items. Assign via dropdown on segment header; assigned item shows as maize badge. Catalog column shows reverse reference (segment name on assigned items). Already-assigned items greyed out in picker.
   - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
   - "Apply All Merges" button appears when pending merges exist
@@ -177,14 +187,16 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 | Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
 | Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json`, merged scenes named after first constituent | Done |
 | Stage 1 scene editing — inline rename, keyframe deletion, time range editing, scene tagging, scene trimming with adjacent-scene absorption | Done |
-| Stage 1 segment detection — black-slug-based segment grouping (content/boundary), segment rename, catalog item assignment (1:1 link), clear segments (preserves tags), segment type filter with counts | Done |
+| Stage 1 segment detection — black-slug-based segment grouping (dual criterion: luminance + std deviation), detection modal (by scene analysis or by existing tags), segment index numbering, segment rename, catalog item assignment (1:1 link), clear segments with confirmation modal, segment type filter with counts | Done |
 | Stage 1 transcript integration — subtitle overlay on video player, toggleable inline transcript editor with edit/delete, click-to-seek timestamps | Done |
 | Stage 1 catalog cross-reference — toggleable catalog column showing items matching video by filename, segment assignment badges, assigned/unassigned filter | Done |
 | Stage 1 transcript view — full transcript in scene browser (cleaned/raw toggle, re-clean, click-to-seek), Scene/Full Video mode with live subtitle overlay on unclamped video player | Done |
 | Stage 1 frontend — three-column master-detail UI (catalog + scene list + preview, with transcript view toggle; merge selection, shift-click range select, scene-scoped video player with subtitles, segment headers, keyframe grid, duration + segment filters, inline rename, tag assignment, trim buttons) | Done |
 | Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
 | Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
-| VLM segment analysis — on-demand Gemma 4 E4B via Ollama, multimodal (keyframes + transcript + metadata), editable prompt, async background job with polling, results in segment bar + detail panel | Done |
+| VLM segment analysis — on-demand Gemma 4 E4B via Ollama, multimodal (keyframes + transcript + metadata), editable prompt with global default (persisted to `data/settings.json`) and per-segment overrides, optional catalog context injection with preview, async background job with polling, results in segment bar + detail panel | Done |
+| Unified ingest pipeline — combined scene detection + transcription in one job with phase progress, unified video list with status indicators | Done |
+| Persistent settings — `data/settings.json` via `GET/PATCH /api/settings`, currently stores VLM default prompt | Done |
 | Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |
 | Stage 2 Extract — Apple Vision OCR on keyframes | Stub view, not implemented |
 | Stage 2 Extract — InsightFace face detection + embeddings | Stub view, not implemented |

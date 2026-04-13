@@ -599,6 +599,35 @@ async def run_export(run_id: str):
     return result
 
 
+# --- Settings ---
+
+SETTINGS_FILE = DATA_DIR / "settings.json"
+
+
+def _load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        return json.loads(SETTINGS_FILE.read_text())
+    return {}
+
+
+def _save_settings(settings: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+
+@app.get("/api/settings")
+async def get_settings():
+    return _load_settings()
+
+
+@app.patch("/api/settings")
+async def update_settings(body: dict):
+    settings = _load_settings()
+    settings.update(body)
+    _save_settings(settings)
+    return settings
+
+
 # --- Main ---
 
 if __name__ == "__main__":

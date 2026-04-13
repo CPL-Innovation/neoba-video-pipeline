@@ -23,6 +23,8 @@ from pipeline.video.ingest import (
 )
 from pipeline.video.transcribe import load_transcript
 
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
+
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 MAX_IMAGES = 6  # cap keyframes to avoid overwhelming the model
@@ -32,6 +34,12 @@ DEFAULT_PROMPT = (
     "(2) any identifiable people, locations, or text on screen, "
     "(3) the apparent era and production style, "
     "(4) the type of content (interview, b-roll, news report, etc.)."
+)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are analyzing keyframes from a 1970s–1980s Northeast Ohio "
+    "broadcast archival video segment. You will be given metadata, "
+    "transcript (if available), and keyframe images from the segment. "
+    "Provide your analysis based on the user's prompt."
 )
 
 
@@ -122,18 +130,50 @@ def _collect_keyframe_paths(
     return paths
 
 
-def _make_summary(full_text: str, max_chars: int = 120) -> str:
-    """Extract a short summary from the full analysis text."""
-    # Take the first sentence or first N chars
+def _make_summary(full_text: str, model: str = DEFAULT_MODEL) -> str:
+    """Generate a concise segment title from the full analysis via Ollama."""
+    try:
+        title = _ollama_chat(model, [
+            {
+                "role": "system",
+                "content": (
+                    "You generate very short, title-case segment titles for archival video. "
+                    "Return ONLY the title — no quotes, no punctuation at the end, no explanation. "
+                    "3-7 words max. Examples: 'Beach Day at Edgewater Park', "
+                    "'Anti-Draft Rally Downtown', 'Mayor Voinovich Press Conference'."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Generate a title for this segment:\n\n{full_text[:500]}",
+            },
+        ])
+        # Clean up: strip quotes, trailing punctuation, whitespace
+        title = title.strip().strip('"\'').rstrip('.!?').strip()
+        if title:
+            return title
+    except Exception:
+        pass
+    # Fallback: first sentence, truncated
     first_line = full_text.split("\n")[0].strip()
-    # Try to end at a sentence boundary
     for end in (".", "!", "?"):
         idx = first_line.find(end)
-        if 0 < idx < max_chars:
+        if 0 < idx < 120:
             return first_line[: idx + 1]
-    if len(first_line) <= max_chars:
+    if len(first_line) <= 120:
         return first_line
-    return first_line[:max_chars].rsplit(" ", 1)[0] + "..."
+    return first_line[:120].rsplit(" ", 1)[0] + "..."
+
+
+def _load_system_prompt() -> str:
+    """Read the VLM system prompt from persisted settings, or use the built-in default."""
+    try:
+        if SETTINGS_FILE.exists():
+            settings = json.loads(SETTINGS_FILE.read_text())
+            return settings.get("vlm_system_prompt", DEFAULT_SYSTEM_PROMPT)
+    except Exception:
+        pass
+    return DEFAULT_SYSTEM_PROMPT
 
 
 def analyze_segment(
@@ -177,10 +217,7 @@ def analyze_segment(
         {
             "role": "system",
             "content": (
-                "You are analyzing keyframes from an archival video segment. "
-                "You will be given metadata, transcript (if available), and "
-                "keyframe images from the segment. Provide your analysis based "
-                "on the user's prompt.\n\n"
+                f"{_load_system_prompt()}\n\n"
                 f"--- Segment Context ---\n{context}"
             ),
         },
@@ -196,15 +233,16 @@ def analyze_segment(
 
     # Build result
     analysis = {
-        "summary": _make_summary(full_analysis),
+        "summary": _make_summary(full_analysis, model),
         "full_analysis": full_analysis,
         "model": model,
         "prompt": prompt,
         "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
-    # Persist to scenes.json
+    # Persist to scenes.json — also populate segment description
     segment["vlm_analysis"] = analysis
+    segment["description"] = full_analysis
     run_dir = VIDEO_RUNS_DIR / video_id
     with open(run_dir / "scenes.json", "w") as f:
         json.dump(result, f, indent=2)

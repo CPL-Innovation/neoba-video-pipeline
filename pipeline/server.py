@@ -601,7 +601,7 @@ async def run_export(run_id: str):
 
 # --- Settings ---
 
-SETTINGS_FILE = DATA_DIR / "settings.json"
+SETTINGS_FILE = BASE_DIR / "pipeline" / "video" / "settings.json"
 
 
 def _load_settings() -> dict:
@@ -611,7 +611,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
 
 

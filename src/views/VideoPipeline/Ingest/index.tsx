@@ -38,6 +38,7 @@ interface Segment {
   segment_index?: number
   type: 'content' | 'boundary'
   name: string
+  description?: string
   item_id?: string | null
   scene_ids: string[]
   start: number
@@ -359,6 +360,46 @@ function TranscriptPanel({
 }) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editText, setEditText] = useState('')
+  const [editingTimestamp, setEditingTimestamp] = useState<{ id: number; field: 'start' | 'end' } | null>(null)
+  const [editTimestampValue, setEditTimestampValue] = useState('')
+
+  /** Parse a mm:ss or mm:ss.d timestamp string into seconds */
+  const parseTimestamp = (str: string): number | null => {
+    const trimmed = str.trim()
+    // mm:ss or mm:ss.d
+    const match = trimmed.match(/^(\d+):(\d{1,2})(?:\.(\d+))?$/)
+    if (!match) return null
+    const mins = parseInt(match[1], 10)
+    const secs = parseInt(match[2], 10)
+    const frac = match[3] ? parseFloat(`0.${match[3]}`) : 0
+    if (secs >= 60) return null
+    return mins * 60 + secs + frac
+  }
+
+  const saveTimestamp = async (id: number, field: 'start' | 'end', value: string) => {
+    const parsed = parseTimestamp(value)
+    if (parsed === null) {
+      setEditingTimestamp(null)
+      return
+    }
+    try {
+      const res = await fetch(
+        `/api/video/videos/${videoId}/transcript/segments`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ updates: [{ id, [field]: parsed }] }),
+        },
+      )
+      if (res.ok) {
+        const data = await res.json()
+        onUpdate(data.segments)
+      }
+    } catch {
+      /* silent */
+    }
+    setEditingTimestamp(null)
+  }
 
   const saveSegment = async (id: number, text: string) => {
     try {
@@ -414,16 +455,60 @@ function TranscriptPanel({
           key={seg.id}
           className="flex gap-2 items-start text-xs group/seg"
         >
-          <span
-            className={`shrink-0 font-mono tabular-nums pt-1 w-20 ${
-              onSeek
-                ? 'text-text-muted hover:text-maize cursor-pointer'
-                : 'text-text-dim'
-            }`}
-            onClick={() => onSeek?.(seg.start)}
-            title="Jump to this segment"
-          >
-            {fmtTime(seg.start)}–{fmtTime(seg.end)}
+          <span className="shrink-0 font-mono tabular-nums pt-1 w-20 flex items-center">
+            {editingTimestamp?.id === seg.id && editingTimestamp.field === 'start' ? (
+              <input
+                value={editTimestampValue}
+                onChange={(e) => setEditTimestampValue(e.target.value)}
+                onBlur={() => saveTimestamp(seg.id, 'start', editTimestampValue)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveTimestamp(seg.id, 'start', editTimestampValue)
+                  if (e.key === 'Escape') setEditingTimestamp(null)
+                }}
+                autoFocus
+                className="w-[3.5rem] bg-bg3 border border-maize/50 rounded px-1 py-0 text-[10px] text-text-primary font-mono focus:outline-none"
+              />
+            ) : (
+              <span
+                className={onSeek ? 'text-text-muted hover:text-maize cursor-pointer' : 'text-text-dim'}
+                onClick={() => onSeek?.(seg.start)}
+                onDoubleClick={(e) => {
+                  e.stopPropagation()
+                  setEditingTimestamp({ id: seg.id, field: 'start' })
+                  setEditTimestampValue(fmtTime(seg.start))
+                }}
+                title="Click to seek · Double-click to edit"
+              >
+                {fmtTime(seg.start)}
+              </span>
+            )}
+            <span className="text-text-dim mx-px">–</span>
+            {editingTimestamp?.id === seg.id && editingTimestamp.field === 'end' ? (
+              <input
+                value={editTimestampValue}
+                onChange={(e) => setEditTimestampValue(e.target.value)}
+                onBlur={() => saveTimestamp(seg.id, 'end', editTimestampValue)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveTimestamp(seg.id, 'end', editTimestampValue)
+                  if (e.key === 'Escape') setEditingTimestamp(null)
+                }}
+                autoFocus
+                className="w-[3.5rem] bg-bg3 border border-maize/50 rounded px-1 py-0 text-[10px] text-text-primary font-mono focus:outline-none"
+              />
+            ) : (
+              <span
+                className={onSeek ? 'text-text-muted hover:text-maize cursor-pointer' : 'text-text-dim'}
+                onClick={() => onSeek?.(seg.end)}
+                onDoubleClick={(e) => {
+                  e.stopPropagation()
+                  setEditingTimestamp({ id: seg.id, field: 'end' })
+                  setEditTimestampValue(fmtTime(seg.end))
+                }}
+                title="Click to seek · Double-click to edit"
+              >
+                {fmtTime(seg.end)}
+              </span>
+            )}
           </span>
           {editingId === seg.id ? (
             <textarea
@@ -503,6 +588,8 @@ export function Ingest() {
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null)
   const [editingSegmentName, setEditingSegmentName] = useState('')
+  const [editingPreviewSegName, setEditingPreviewSegName] = useState<string | null>(null)
+  const [previewSegNameDraft, setPreviewSegNameDraft] = useState('')
   const [collapsedSegments, setCollapsedSegments] = useState<Set<string>>(
     new Set(),
   )
@@ -527,8 +614,15 @@ export function Ingest() {
   const [vlmPromptOverrides, setVlmPromptOverrides] = useState<
     Record<string, string>
   >({})
+  const DEFAULT_VLM_SYSTEM_PROMPT =
+    'You are analyzing keyframes from a 1970s\u20131980s Northeast Ohio broadcast archival video segment. You will be given metadata, transcript (if available), and keyframe images from the segment. Provide your analysis based on the user\u2019s prompt.'
+  const [vlmSystemPrompt, setVlmSystemPrompt] = useState(DEFAULT_VLM_SYSTEM_PROMPT)
+  // "Saved defaults" — what Reset restores to (loaded from settings, falls back to code constant)
+  const [vlmSavedDefaultPrompt, setVlmSavedDefaultPrompt] = useState(DEFAULT_VLM_PROMPT)
+  const [vlmSavedDefaultSystemPrompt, setVlmSavedDefaultSystemPrompt] = useState(DEFAULT_VLM_SYSTEM_PROMPT)
   const [showVlmSettings, setShowVlmSettings] = useState(false)
   const [vlmSettingsDraft, setVlmSettingsDraft] = useState('')
+  const [vlmSystemPromptDraft, setVlmSystemPromptDraft] = useState('')
   // Active prompt for the currently-open segment editor
   const vlmPrompt =
     vlmPromptSegmentId && vlmPromptOverrides[vlmPromptSegmentId] != null
@@ -540,7 +634,10 @@ export function Ingest() {
   }
   const [vlmRunning, setVlmRunning] = useState<string | null>(null)
   const [showVlmAnalysis, setShowVlmAnalysis] = useState(false)
+  const [showVlmRaw, setShowVlmRaw] = useState(false)
   const [showVlmFullPrompt, setShowVlmFullPrompt] = useState(false)
+  const [showSegmentJson, setShowSegmentJson] = useState(false)
+  const [segmentTab, setSegmentTab] = useState<'keyframes' | 'transcript' | 'description' | 'json'>('keyframes')
   const [includeCatalogContext, setIncludeCatalogContext] = useState(true)
   const [showCatalog, setShowCatalog] = useState(false)
   const [catalogItems, setCatalogItems] = useState<(SourceItem & { item_id: string; classification?: ClassifiedItem })[]>([])
@@ -608,11 +705,11 @@ export function Ingest() {
     }
   }
 
-  // Build reverse lookup: item_id → segment name
+  // Build reverse lookup: item_id → segment label (S + index)
   const itemToSegment = new Map<string, string>()
   if (result?.segments) {
     for (const seg of result.segments) {
-      if (seg.item_id) itemToSegment.set(seg.item_id, seg.name)
+      if (seg.item_id) itemToSegment.set(seg.item_id, seg.segment_index != null ? `S${seg.segment_index}` : seg.name)
     }
   }
 
@@ -973,6 +1070,27 @@ export function Ingest() {
     }
   }
 
+  const commitPreviewSegRename = async () => {
+    if (!result || !editingPreviewSegName) return
+    const newName = previewSegNameDraft.trim()
+    if (!newName) {
+      setEditingPreviewSegName(null)
+      return
+    }
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/segments/${editingPreviewSegName}/rename`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: newName }),
+        },
+      )
+      if (res.ok) setResult(await res.json())
+    } catch { /* silent */ }
+    setEditingPreviewSegName(null)
+  }
+
   const assignItemToSegment = async (segmentId: string, itemId: string | null) => {
     if (!result) return
     setError(null)
@@ -1149,7 +1267,14 @@ export function Ingest() {
     fetch('/api/settings')
       .then((r) => r.json())
       .then((s) => {
-        if (s.vlm_default_prompt) setVlmDefaultPrompt(s.vlm_default_prompt)
+        if (s.vlm_default_prompt) {
+          setVlmDefaultPrompt(s.vlm_default_prompt)
+          setVlmSavedDefaultPrompt(s.vlm_default_prompt)
+        }
+        if (s.vlm_system_prompt) {
+          setVlmSystemPrompt(s.vlm_system_prompt)
+          setVlmSavedDefaultSystemPrompt(s.vlm_system_prompt)
+        }
       })
       .catch(() => {})
     return () => stopPolling()
@@ -1564,6 +1689,7 @@ export function Ingest() {
             type="button"
             onClick={() => {
               setVlmSettingsDraft(vlmDefaultPrompt)
+              setVlmSystemPromptDraft(vlmSystemPrompt)
               setShowVlmSettings(true)
             }}
             className="p-1.5 rounded border border-white/10 text-text-dim hover:text-text-muted hover:border-white/20 transition-colors"
@@ -2388,11 +2514,51 @@ export function Ingest() {
                 )}
 
                 <div className="space-y-1">
-                  <h3 className="text-sm font-medium text-text-primary">
+                  <h3 className="text-sm font-medium text-text-primary flex items-center gap-1.5">
                     {previewSegment.segment_index != null && (
-                      <span className="text-text-dim font-mono mr-1.5">S{previewSegment.segment_index}</span>
+                      <span className="text-text-dim font-mono shrink-0">S{previewSegment.segment_index}</span>
                     )}
-                    {previewSegment.name}
+                    {editingPreviewSegName === previewSegment.segment_id ? (
+                      <input
+                        value={previewSegNameDraft}
+                        onChange={(e) => setPreviewSegNameDraft(e.target.value)}
+                        onBlur={() => commitPreviewSegRename()}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') commitPreviewSegRename()
+                          if (e.key === 'Escape') setEditingPreviewSegName(null)
+                        }}
+                        autoFocus
+                        className="flex-1 bg-bg3 border border-maize/50 rounded px-2 py-0.5 text-sm text-text-primary focus:outline-none"
+                      />
+                    ) : (
+                      <span
+                        className="cursor-text hover:text-maize transition-colors"
+                        onDoubleClick={() => {
+                          setEditingPreviewSegName(previewSegment.segment_id)
+                          setPreviewSegNameDraft(previewSegment.name)
+                        }}
+                        title="Double-click to rename"
+                      >
+                        {previewSegment.name}
+                      </span>
+                    )}
+                    {previewSegment.vlm_analysis?.summary && editingPreviewSegName !== previewSegment.segment_id && (
+                      <button
+                        type="button"
+                        title={`Use VLM title: "${previewSegment.vlm_analysis.summary}"`}
+                        onClick={() => {
+                          setEditingPreviewSegName(previewSegment.segment_id)
+                          setPreviewSegNameDraft(previewSegment.vlm_analysis!.summary)
+                        }}
+                        className="shrink-0 p-0.5 rounded text-text-dim hover:text-violet-300 transition-colors"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 2l1.09 3.36L16 6l-2.91.64L12 10l-1.09-3.36L8 6l2.91-.64L12 2z" />
+                          <path d="M5 15l.68 2.1L8 17.78l-1.82.4L5 20.27l-.68-2.1L2 17.78l1.82-.4L5 15z" />
+                          <path d="M18 12l.68 2.1L21 14.78l-1.82.4L18 17.27l-.68-2.1L15 14.78l1.82-.4L18 12z" />
+                        </svg>
+                      </button>
+                    )}
                   </h3>
                   <p className="text-xs text-text-dim">
                     {fmtTime(previewSegment.start)} → {fmtTime(previewSegment.end)}
@@ -2420,77 +2586,132 @@ export function Ingest() {
                   </div>
                 </div>
 
-                {/* Transcript toggle + editor */}
-                {transcriptSegments && (
-                  <div>
+                {/* Tab bar: Keyframes | Transcript | Description | JSON */}
+                <div className="flex gap-1 border-b border-white/10 pb-0">
+                  {([
+                    { id: 'keyframes' as const, label: 'Keyframes', show: allKeyframes.length > 0 },
+                    { id: 'transcript' as const, label: 'Transcript', show: !!transcriptSegments },
+                    { id: 'description' as const, label: `Description${previewSegment.description ? ' ✦' : ''}`, show: previewSegment.type === 'content' },
+                    { id: 'json' as const, label: 'JSON', show: true },
+                  ] as const).filter(t => t.show).map(t => (
                     <button
+                      key={t.id}
                       type="button"
-                      onClick={() => setShowTranscript((v) => !v)}
-                      className={`text-xs px-2 py-1 rounded border ${
-                        showTranscript
-                          ? 'border-maize/40 bg-maize/10 text-maize'
-                          : 'border-white/10 text-text-dim hover:text-text-muted'
+                      onClick={() => setSegmentTab(t.id)}
+                      className={`text-xs px-2.5 py-1.5 -mb-px border-b-2 transition-colors ${
+                        segmentTab === t.id
+                          ? 'border-violet-400 text-text-primary'
+                          : 'border-transparent text-text-dim hover:text-text-muted'
                       }`}
                     >
-                      Transcript
+                      {t.label}
                     </button>
-                    {showTranscript && (
-                      <div className="mt-2 border-t border-white/5 pt-2">
-                        <TranscriptPanel
-                          segments={transcriptSegments.filter(
-                            (s) =>
-                              s.end > previewSegment.start &&
-                              s.start < previewSegment.end,
-                          )}
-                          videoId={result.video_id}
-                          onUpdate={setTranscriptSegments}
-                          onSeek={(t) => {
-                            const v = document.querySelector('video')
-                            if (v) v.currentTime = t
-                          }}
-                        />
-                      </div>
+                  ))}
+                </div>
+
+                {/* Tab: Keyframes */}
+                {segmentTab === 'keyframes' && allKeyframes.length > 0 && (() => {
+                  const kfToScene = new Map<string, { sceneId: string; count: number }>()
+                  for (const s of chScenes) {
+                    for (const kf of s.keyframes) {
+                      kfToScene.set(kf.path, { sceneId: s.scene_id, count: s.keyframes.length })
+                    }
+                  }
+                  return (
+                    <div className="grid grid-cols-3 gap-2">
+                      {allKeyframes.map((kf) => {
+                        const owner = kfToScene.get(kf.path)
+                        return (
+                          <figure
+                            key={kf.path}
+                            className="relative flex flex-col items-center gap-1 group/kf"
+                          >
+                            <div className="relative w-full">
+                              <img
+                                src={`/api/video/videos/${result.video_id}/keyframes/${kf.path.split('/').pop()}`}
+                                alt={kf.path}
+                                className="w-full rounded border border-white/10 cursor-pointer hover:border-white/30 transition-colors"
+                                onClick={() => {
+                                  const v = document.querySelector('video')
+                                  if (v) v.currentTime = kf.timestamp
+                                }}
+                              />
+                              {owner && owner.count > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() => deleteKeyframe(owner.sceneId, kf.path)}
+                                  className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-black/70 text-text-dim hover:text-coral text-[10px] leading-none flex items-center justify-center opacity-0 group-hover/kf:opacity-100 transition-opacity"
+                                  title="Delete keyframe"
+                                >
+                                  ×
+                                </button>
+                              )}
+                            </div>
+                            <figcaption className="text-[10px] text-text-dim font-mono">
+                              {kf.role ?? `frame ${kf.index}`} ·{' '}
+                              {fmtTime(kf.timestamp)}
+                            </figcaption>
+                          </figure>
+                        )
+                      })}
+                    </div>
+                  )
+                })()}
+
+                {/* Tab: Transcript */}
+                {segmentTab === 'transcript' && transcriptSegments && (
+                  <TranscriptPanel
+                    segments={transcriptSegments.filter(
+                      (s) =>
+                        s.end > previewSegment.start &&
+                        s.start < previewSegment.end,
                     )}
-                  </div>
+                    videoId={result.video_id}
+                    onUpdate={setTranscriptSegments}
+                    onSeek={(t) => {
+                      const v = document.querySelector('video')
+                      if (v) v.currentTime = t
+                    }}
+                  />
                 )}
 
-                {/* VLM Analysis toggle + display */}
-                {previewSegment.type === 'content' && (
-                  <div>
-                    <div className="flex gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setShowVlmAnalysis((v) => !v)}
-                        className={`text-xs px-2 py-1 rounded border ${
-                          showVlmAnalysis
-                            ? 'border-violet-400/40 bg-violet-500/10 text-violet-300'
-                            : 'border-white/10 text-text-dim hover:text-text-muted'
-                        }`}
-                      >
-                        VLM Analysis
-                        {previewSegment.vlm_analysis && ' ✦'}
-                      </button>
-                      {!previewSegment.vlm_analysis && !showVlmAnalysis && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setVlmPromptSegmentId(previewSegment.segment_id)
-                            setShowVlmAnalysis(true)
-                          }}
-                          className="text-xs px-2 py-1 rounded border border-violet-500/20 text-violet-300/60 hover:text-violet-300 hover:bg-violet-500/10 transition-colors"
-                        >
-                          Analyze
-                        </button>
-                      )}
-                    </div>
-                    {showVlmAnalysis && (
-                      <div className="mt-2 border-t border-white/5 pt-2 space-y-3">
-                        {previewSegment.vlm_analysis ? (
-                          <>
-                            <p className="text-xs text-text-primary whitespace-pre-wrap leading-relaxed">
+                {/* Tab: Description */}
+                {segmentTab === 'description' && previewSegment.type === 'content' && (
+                  <div className="space-y-3">
+                    {previewSegment.vlm_analysis ? (
+                      <>
+                        {/* Sub-toggle: Description vs VLM raw output */}
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => setShowVlmRaw(false)}
+                            className={`text-[10px] px-1.5 py-0.5 rounded ${
+                              !showVlmRaw
+                                ? 'bg-violet-500/20 text-violet-300'
+                                : 'text-text-dim hover:text-text-muted'
+                            }`}
+                          >
+                            Description
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setShowVlmRaw(true)}
+                            className={`text-[10px] px-1.5 py-0.5 rounded ${
+                              showVlmRaw
+                                ? 'bg-violet-500/20 text-violet-300'
+                                : 'text-text-dim hover:text-text-muted'
+                            }`}
+                          >
+                            VLM Output
+                          </button>
+                        </div>
+
+                        {showVlmRaw ? (
+                          <div>
+                            <p className="text-xs text-text-primary whitespace-pre-wrap leading-relaxed bg-bg3 border border-white/10 rounded px-2 py-1.5">
                               {previewSegment.vlm_analysis.full_analysis}
                             </p>
-                            <details className="text-[10px] text-text-dim">
+                            <details className="mt-2 text-[10px] text-text-dim">
                               <summary className="cursor-pointer hover:text-text-muted">
                                 {previewSegment.vlm_analysis.model} · {previewSegment.vlm_analysis.analyzed_at}
                               </summary>
@@ -2498,19 +2719,48 @@ export function Ingest() {
                                 {previewSegment.vlm_analysis.prompt}
                               </p>
                             </details>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setVlmPromptSegmentId(
-                                  vlmPromptSegmentId === previewSegment.segment_id
-                                    ? null
-                                    : previewSegment.segment_id,
+                          </div>
+                        ) : (
+                          <textarea
+                            defaultValue={previewSegment.description ?? previewSegment.vlm_analysis.full_analysis}
+                            key={`desc-${previewSegment.segment_id}-${previewSegment.vlm_analysis.analyzed_at}`}
+                            rows={6}
+                            onBlur={(e) => {
+                              const val = e.target.value.trim()
+                              const prev = previewSegment.description ?? previewSegment.vlm_analysis!.full_analysis
+                              if (val && val !== prev) {
+                                fetch(
+                                  `/api/video/videos/${result.video_id}/segments/${previewSegment.segment_id}/description`,
+                                  {
+                                    method: 'PATCH',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ description: val }),
+                                  },
                                 )
+                                  .then((r) => r.json())
+                                  .then((data) => {
+                                    setResult(data)
+                                  })
+                                  .catch(() => {})
                               }
-                              className="text-[10px] px-2 py-0.5 rounded border border-violet-500/20 text-violet-300/60 hover:text-violet-300 transition-colors"
-                            >
-                              Re-analyze
-                            </button>
+                            }}
+                            className="w-full bg-bg3 border border-white/10 rounded px-2 py-1.5 text-xs text-text-primary resize-y focus:outline-none focus:border-violet-500/40 leading-relaxed"
+                          />
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setVlmPromptSegmentId(
+                              vlmPromptSegmentId === previewSegment.segment_id
+                                ? null
+                                : previewSegment.segment_id,
+                            )
+                          }
+                          className="text-[10px] px-2 py-0.5 rounded border border-violet-500/20 text-violet-300/60 hover:text-violet-300 transition-colors"
+                        >
+                          Re-analyze
+                        </button>
                             {vlmPromptSegmentId === previewSegment.segment_id && (
                               <div className="p-2 rounded-md border border-violet-500/20 bg-violet-500/5 space-y-2">
                                 <textarea
@@ -2610,9 +2860,6 @@ export function Ingest() {
                                     />
                                     Include catalog context
                                   </label>
-                                  <span className="text-[10px] text-text-dim">
-                                    gemma4:e4b via Ollama
-                                  </span>
                                   <button
                                     type="button"
                                     onClick={() => setVlmPromptSegmentId(null)}
@@ -2637,58 +2884,15 @@ export function Ingest() {
                             )}
                           </div>
                         )}
-                      </div>
-                    )}
                   </div>
                 )}
 
-                {allKeyframes.length > 0 && (() => {
-                  // Build keyframe→scene lookup for deletion
-                  const kfToScene = new Map<string, { sceneId: string; count: number }>()
-                  for (const s of chScenes) {
-                    for (const kf of s.keyframes) {
-                      kfToScene.set(kf.path, { sceneId: s.scene_id, count: s.keyframes.length })
-                    }
-                  }
-                  return (
-                    <div className="grid grid-cols-3 gap-2">
-                      {allKeyframes.map((kf) => {
-                        const owner = kfToScene.get(kf.path)
-                        return (
-                          <figure
-                            key={kf.path}
-                            className="relative flex flex-col items-center gap-1 group/kf"
-                          >
-                            <div className="relative w-full">
-                              <img
-                                src={keyframeUrl(result.video_id, kf)}
-                                alt=""
-                                loading="lazy"
-                                className="w-full rounded border border-white/10 bg-black"
-                              />
-                              {owner && owner.count > 1 && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    deleteKeyframe(owner.sceneId, kf.path)
-                                  }
-                                  className="absolute top-1 right-1 w-5 h-5 rounded-full bg-black/70 text-text-dim hover:bg-coral hover:text-white flex items-center justify-center text-xs leading-none opacity-0 group-hover/kf:opacity-100 transition-opacity"
-                                  title="Remove keyframe"
-                                >
-                                  ✕
-                                </button>
-                              )}
-                            </div>
-                            <figcaption className="text-[10px] text-text-dim font-mono">
-                              {kf.role ?? `frame ${kf.index}`} ·{' '}
-                              {fmtTime(kf.timestamp)}
-                            </figcaption>
-                          </figure>
-                        )
-                      })}
-                    </div>
-                  )
-                })()}
+                {/* Tab: JSON */}
+                {segmentTab === 'json' && (
+                  <pre className="whitespace-pre-wrap text-[10px] text-text-dim bg-bg3 border border-white/10 rounded p-2 max-h-96 overflow-y-auto">
+                    {JSON.stringify(previewSegment, null, 2)}
+                  </pre>
+                )}
               </div>
             )
           })() : previewScene ? (
@@ -2987,76 +3191,126 @@ export function Ingest() {
           onClick={() => setShowVlmSettings(false)}
         >
           <div
-            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-lg p-5 space-y-4"
+            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-lg p-5 space-y-5"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 className="text-sm font-medium text-text-primary">
-              Default VLM Prompt
-            </h3>
-            <p className="text-xs text-text-dim">
-              This prompt is used for all VLM segment analysis. Changing it will
-              reset any per-segment prompt edits back to this new default.
-            </p>
-            <textarea
-              value={vlmSettingsDraft}
-              onChange={(e) => setVlmSettingsDraft(e.target.value)}
-              rows={6}
-              className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary resize-y focus:outline-none focus:border-maize/40"
-            />
-            <div className="flex items-center justify-between">
-              <button
-                type="button"
-                onClick={() => {
-                  setVlmSettingsDraft(DEFAULT_VLM_PROMPT)
-                }}
-                className="text-xs text-text-dim hover:text-text-muted transition-colors"
-              >
-                Reset to built-in default
-              </button>
-              <div className="flex gap-2">
+            {/* System Prompt */}
+            <div className="space-y-2">
+              <h3 className="text-sm font-medium text-text-primary">
+                System Prompt
+              </h3>
+              <p className="text-xs text-text-dim">
+                Sets the VLM&rsquo;s role and context framing for all segment
+                analyses. Segment metadata and transcript are appended
+                automatically.
+              </p>
+              <textarea
+                value={vlmSystemPromptDraft}
+                onChange={(e) => setVlmSystemPromptDraft(e.target.value)}
+                rows={4}
+                className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary resize-y focus:outline-none focus:border-maize/40"
+              />
+              <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  disabled={!vlmSettingsDraft.trim()}
-                  onClick={() => {
-                    const prompt = vlmSettingsDraft.trim()
-                    fetch('/api/settings', {
-                      method: 'PATCH',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ vlm_default_prompt: prompt }),
-                    }).catch(() => {})
-                    setVlmDefaultPrompt(prompt)
-                    setShowVlmSettings(false)
-                  }}
-                  className="px-3 py-1.5 rounded text-xs font-medium text-text-dim hover:text-text-primary border border-white/10 hover:border-white/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  onClick={() => setVlmSystemPromptDraft(vlmSavedDefaultSystemPrompt)}
+                  className="text-xs text-text-dim hover:text-text-muted transition-colors"
                 >
-                  Save as Default
+                  Reset to default
                 </button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowVlmSettings(false)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={!vlmSettingsDraft.trim()}
+                <button
+                  type="button"
+                  disabled={!vlmSystemPromptDraft.trim() || vlmSystemPromptDraft.trim() === vlmSavedDefaultSystemPrompt}
                   onClick={() => {
-                    const newDefault = vlmSettingsDraft.trim()
-                    setVlmDefaultPrompt(newDefault)
-                    setVlmPromptOverrides({}) // reset all per-segment overrides
-                    setShowVlmSettings(false)
-                    // Also persist
+                    const val = vlmSystemPromptDraft.trim()
+                    setVlmSavedDefaultSystemPrompt(val)
                     fetch('/api/settings', {
                       method: 'PATCH',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ vlm_default_prompt: newDefault }),
+                      body: JSON.stringify({ vlm_system_prompt: val }),
                     }).catch(() => {})
                   }}
+                  className="text-xs text-maize/70 hover:text-maize transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                 >
-                  Apply to All
-                </Button>
+                  Save as default
+                </button>
               </div>
+            </div>
+
+            <hr className="border-white/10" />
+
+            {/* Default VLM Prompt */}
+            <div className="space-y-2">
+              <h3 className="text-sm font-medium text-text-primary">
+                Default VLM Prompt
+              </h3>
+              <p className="text-xs text-text-dim">
+                This prompt is used for all VLM segment analysis. Changing it will
+                reset any per-segment prompt edits back to this new default.
+              </p>
+              <textarea
+                value={vlmSettingsDraft}
+                onChange={(e) => setVlmSettingsDraft(e.target.value)}
+                rows={6}
+                className="w-full bg-bg3 border border-white/10 rounded-md px-3 py-2 text-sm text-text-primary resize-y focus:outline-none focus:border-maize/40"
+              />
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setVlmSettingsDraft(vlmSavedDefaultPrompt)}
+                  className="text-xs text-text-dim hover:text-text-muted transition-colors"
+                >
+                  Reset to default
+                </button>
+                <button
+                  type="button"
+                  disabled={!vlmSettingsDraft.trim() || vlmSettingsDraft.trim() === vlmSavedDefaultPrompt}
+                  onClick={() => {
+                    const val = vlmSettingsDraft.trim()
+                    setVlmSavedDefaultPrompt(val)
+                    fetch('/api/settings', {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ vlm_default_prompt: val }),
+                    }).catch(() => {})
+                  }}
+                  className="text-xs text-maize/70 hover:text-maize transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  Save as default
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowVlmSettings(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={!vlmSettingsDraft.trim() || !vlmSystemPromptDraft.trim()}
+                onClick={() => {
+                  const newDefault = vlmSettingsDraft.trim()
+                  const newSystem = vlmSystemPromptDraft.trim()
+                  setVlmDefaultPrompt(newDefault)
+                  setVlmSystemPrompt(newSystem)
+                  setVlmPromptOverrides({})
+                  setShowVlmSettings(false)
+                  fetch('/api/settings', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      vlm_default_prompt: newDefault,
+                      vlm_system_prompt: newSystem,
+                    }),
+                  }).catch(() => {})
+                }}
+              >
+                Save
+              </Button>
             </div>
           </div>
         </div>

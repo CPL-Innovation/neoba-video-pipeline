@@ -95,16 +95,18 @@ Segments are narrative units made of scenes, detected via black-slug analysis. B
 - `build_segments()` — detects slugs, tags scenes with `black_slug`, groups consecutive non-slug scenes into `content` segments and slug scenes into `boundary` segments. Auto-numbers content segments sequentially ("Segment 1", "Segment 2", ...) with a `segment_index` field (1, 2, 3, ...) and names boundary segments "Boundary".
 - `build_segments_from_tags()` — alternative detection method that uses existing `black_slug` tags as dividers instead of running luminance analysis. Useful when tags have been manually curated.
 - `rename_segment()` — rename a segment's display name.
+- `update_segment_description()` — update a segment's description field. Persists to `scenes.json`.
 - `assign_item_to_segment()` — link a catalog item to a segment (1:1). Stores `item_id` on the segment object in `scenes.json`.
 - `clear_segments()` — removes segment grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved. Requires user confirmation via modal.
 - On-demand, not automatic — user triggers detection from a modal offering two methods: scene analysis (luminance) or by existing slug tags.
-- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `segment_index`, `type` (`content`/`boundary`), `name`, `item_id` (optional catalog link), `scene_ids`, `start`, `end`. Scene `tags` array is per-scene metadata.
+- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `segment_index`, `type` (`content`/`boundary`), `name`, `description` (editable, auto-populated from VLM), `item_id` (optional catalog link), `scene_ids`, `start`, `end`, `vlm_analysis` (optional). Scene `tags` array is per-scene metadata.
 
 **Transcript editing** (`pipeline/video/router.py`)
 
 - **Inline transcript editor**: Toggle a "Transcript" panel in the scene/segment preview to view and edit transcript segments overlapping the current time range. Click segment text to edit inline, press Enter to save. Delete segments with ✕. Changes persist immediately to `transcript.json`.
 - **Subtitle overlay**: When `transcript.json` exists, subtitles display automatically on the video player during playback, synced to scene/segment time bounds. Subtitles update in real-time after transcript edits.
 - **Click-to-seek**: Click a transcript segment's timestamp to jump the video to that position.
+- **Timestamp editing**: Double-click a transcript segment's start or end timestamp to edit it inline. Accepts `mm:ss` or `mm:ss.d` format. Persists to `transcript.json`.
 
 **VLM segment analysis** (`pipeline/video/vlm.py`)
 
@@ -113,9 +115,12 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 - `analyze_segment()` — collects keyframes (capped at 6, evenly sampled), transcript text overlapping the segment's time range, and metadata (name, type, duration, scene count). Sends as a multimodal prompt to Ollama and persists the result.
 - `_ollama_chat()` — wraps the Ollama `/api/chat` endpoint with base64 image support. Uses stdlib `urllib` (no extra dependencies).
 - Default model: **Gemma 4 E4B** via Ollama (multimodal, ~9 GB). Configurable per-request.
-- Default prompt is an archival analysis template (visual content, people/locations, era, content type). Fully editable from the UI before each run, with a global default (persisted to `data/settings.json`) and per-segment overrides.
+- **Configurable system prompt**: Sets the VLM's role and context framing (default: 1970s–1980s Northeast Ohio broadcast archival). Editable in the VLM settings modal alongside the default user prompt. Both have "Save as default" (persists to `pipeline/video/settings.json`) and "Reset to default" buttons. The backend reads the system prompt from settings at analysis time — not passed per-request.
+- Default user prompt is an archival analysis template (visual content, people/locations, era, content type). Fully editable from the UI before each run, with a global default (persisted to `pipeline/video/settings.json`) and per-segment overrides.
 - **Catalog context injection**: When a segment has a linked catalog item, date, description, and additional notes from the item are appended to the VLM prompt automatically. This is controlled by an "Include catalog context" checkbox (checked by default) next to the Run VLM button. A "Preview full prompt" toggle shows the final concatenated prompt before sending.
-- Results stored directly on the segment object in `scenes.json` as `vlm_analysis: { summary, full_analysis, model, prompt, analyzed_at }`.
+- **VLM-generated titles**: `_make_summary()` now makes a follow-up Ollama call to generate a concise 3-7 word title-case segment title (e.g., "Beach Day at Edgewater Park") instead of truncating the first sentence. Falls back to sentence truncation if Ollama fails.
+- **Auto-populates `description`**: When VLM analysis completes, the full analysis text is written to `segment.description`. This field is editable from the UI and persisted independently of the VLM analysis.
+- Results stored directly on the segment object in `scenes.json` as `vlm_analysis: { summary, full_analysis, model, prompt, analyzed_at }` plus `description` (editable copy).
 - Runs in a background thread (same pattern as ingest/transcribe) with status polling, since inference takes ~1 min per image on Apple Silicon.
 
 **Backend HTTP** (`pipeline/video/router.py`, mounted at `/api/video`)
@@ -135,6 +140,7 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 - `POST /videos/{video_id}/segments/detect` — detect black slugs via luminance analysis and group scenes into segments
 - `POST /videos/{video_id}/segments/detect-from-tags` — detect segments using existing `black_slug` tags as dividers
 - `PATCH /videos/{video_id}/segments/{segment_id}/rename` — rename a segment
+- `PATCH /videos/{video_id}/segments/{segment_id}/description` — update a segment's description
 - `PATCH /videos/{video_id}/segments/{segment_id}/assign-item` — assign a catalog item_id to a segment (or `null` to unassign)
 - `DELETE /videos/{video_id}/segments` — clear all segment grouping data (preserves scene tags)
 - `POST /videos/{video_id}/segments/{segment_id}/analyze` — kick off VLM analysis in background thread, returns `{ status: "started" }`

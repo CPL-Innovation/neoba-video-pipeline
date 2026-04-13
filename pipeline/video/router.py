@@ -23,6 +23,7 @@ from pipeline.video.segments import (
     build_segments_from_tags,
     clear_segments,
     rename_segment,
+    update_segment_description,
 )
 from pipeline.video.ingest import (
     VIDEO_RUNS_DIR,
@@ -566,7 +567,9 @@ async def get_transcript(video_id: str):
 
 class SegmentUpdate(BaseModel):
     id: int
-    text: str
+    text: str | None = None
+    start: float | None = None
+    end: float | None = None
 
 
 class TranscriptEditRequest(BaseModel):
@@ -594,10 +597,16 @@ async def edit_transcript_segments(video_id: str, req: TranscriptEditRequest):
     segments: list[dict] = transcript.get("segments", [])
 
     # Apply updates
-    update_map = {u.id: u.text for u in req.updates}
+    update_map = {u.id: u for u in req.updates}
     for seg in segments:
         if seg["id"] in update_map:
-            seg["text"] = update_map[seg["id"]]
+            u = update_map[seg["id"]]
+            if u.text is not None:
+                seg["text"] = u.text
+            if u.start is not None:
+                seg["start"] = u.start
+            if u.end is not None:
+                seg["end"] = u.end
 
     # Apply deletions
     delete_set = set(req.deletions)
@@ -691,6 +700,10 @@ class SegmentRenameRequest(BaseModel):
     name: str
 
 
+class SegmentDescriptionRequest(BaseModel):
+    description: str
+
+
 @router.post("/videos/{video_id}/segments/detect")
 async def detect_segments(video_id: str, req: SegmentDetectRequest):
     """Detect black slugs and group scenes into segments."""
@@ -728,6 +741,20 @@ async def rename_segment_endpoint(
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
         rename_segment(video_id, segment_id, req.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.patch("/videos/{video_id}/segments/{segment_id}/description")
+async def update_description_endpoint(
+    video_id: str, segment_id: str, req: SegmentDescriptionRequest
+):
+    """Update a segment's description."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        update_segment_description(video_id, segment_id, req.description)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)

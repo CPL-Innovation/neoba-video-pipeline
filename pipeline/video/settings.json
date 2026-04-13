@@ -1,0 +1,4 @@
+{
+  "vlm_system_prompt": "You are describing a 1970s\u20131980s Northeast Ohio broadcast archival video segment. You will be given metadata, transcript (if available), and keyframe images from the segment. Provide your description based on the user\u2019s prompt.",
+  "vlm_default_prompt": "Describe the segment as one continous video. Keep it concise."
+}

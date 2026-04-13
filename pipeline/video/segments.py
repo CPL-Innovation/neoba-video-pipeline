@@ -328,6 +328,28 @@ def assign_item_to_segment(
     return result
 
 
+def update_segment_description(
+    video_id: str, segment_id: str, description: str
+) -> IngestResult:
+    """Update the description field of a segment in scenes.json."""
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    segments = result.get("segments", [])  # type: ignore[assignment]
+    target = next((c for c in segments if c["segment_id"] == segment_id), None)
+    if target is None:
+        raise ValueError(f"Unknown segment_id: {segment_id}")
+
+    target["description"] = description
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+
 def clear_segments(video_id: str) -> IngestResult:
     """Remove segment grouping data from scenes.json. Scene tags are preserved."""
     result = load_ingest_result(video_id)

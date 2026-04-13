@@ -208,6 +208,31 @@ def rename_segment(video_id: str, segment_id: str, new_name: str) -> IngestResul
     return result
 
 
+def assign_item_to_segment(
+    video_id: str, segment_id: str, item_id: str | None
+) -> IngestResult:
+    """Assign (or unassign) a catalog item_id to a segment in scenes.json."""
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    segments = result.get("segments", [])  # type: ignore[assignment]
+    target = next((c for c in segments if c["segment_id"] == segment_id), None)
+    if target is None:
+        raise ValueError(f"Unknown segment_id: {segment_id}")
+
+    if item_id:
+        target["item_id"] = item_id
+    else:
+        target.pop("item_id", None)
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+
 def clear_segments(video_id: str) -> IngestResult:
     """Remove segment grouping data from scenes.json. Scene tags are preserved."""
     result = load_ingest_result(video_id)

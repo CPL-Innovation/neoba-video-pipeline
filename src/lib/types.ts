@@ -14,6 +14,7 @@ export interface SourceItem {
   sound: string
   color: string
   hdd: string
+  filename: string
   thread: string
 }
 

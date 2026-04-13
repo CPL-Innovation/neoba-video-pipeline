@@ -34,6 +34,7 @@ export function ReviewTable() {
   const [processedFilter, setProcessedFilter] = useState<ProcessedFilter>('')
   const [genreFilter, setGenreFilter] = useState<string>('')
   const [crypticFilter, setCrypticFilter] = useState(false)
+  const [duplicatesFilter, setDuplicatesFilter] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [showBaseline, setShowBaseline] = useState(false)
   const [expandedRow, setExpandedRow] = useState<string | null>(null)
@@ -115,6 +116,15 @@ export function ReviewTable() {
   const processedCount = useMemo(() => items.filter((i) => i.classification).length, [items])
   const unprocessedCount = useMemo(() => items.filter((i) => !i.classification).length, [items])
 
+  const duplicateIds = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const item of items) {
+      counts.set(item.item_id, (counts.get(item.item_id) || 0) + 1)
+    }
+    return new Set([...counts.entries()].filter(([, c]) => c > 1).map(([id]) => id))
+  }, [items])
+  const duplicateCount = useMemo(() => items.filter((i) => duplicateIds.has(i.item_id)).length, [items, duplicateIds])
+
   const filteredItems = useMemo(() => {
     let result = items
 
@@ -159,6 +169,11 @@ export function ReviewTable() {
       result = result.filter((item) => item.classification?.is_cryptic)
     }
 
+    // Duplicates filter
+    if (duplicatesFilter) {
+      result = result.filter((item) => duplicateIds.has(item.item_id))
+    }
+
     // Search by description
     if (searchQuery.trim()) {
       const query = searchQuery.trim().toLowerCase()
@@ -168,7 +183,7 @@ export function ReviewTable() {
     }
 
     return result
-  }, [items, processedFilter, threadFilter, confidenceFilter, genreFilter, crypticFilter, searchQuery])
+  }, [items, processedFilter, threadFilter, confidenceFilter, genreFilter, crypticFilter, duplicatesFilter, duplicateIds, searchQuery])
 
   const columns = useMemo<ColumnDef<MergedItem>[]>(
     () => [
@@ -431,6 +446,16 @@ export function ReviewTable() {
               className="rounded"
             />
             Cryptic items only
+          </label>
+
+          <label className="flex items-center gap-2 text-xs text-text-muted">
+            <input
+              type="checkbox"
+              checked={duplicatesFilter}
+              onChange={(e) => setDuplicatesFilter(e.target.checked)}
+              className="rounded"
+            />
+            Duplicates only ({duplicateCount})
           </label>
 
           <label className="flex items-center gap-2 text-xs text-text-muted">

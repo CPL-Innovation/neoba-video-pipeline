@@ -13,7 +13,7 @@ LLM-powered classification and entity extraction tool for the NEOBA (Northeast O
 | View | Description |
 |------|-------------|
 | Run Classification | Execute Tier 1+2 (LLM) and Tier 3 (clustering) with real-time progress tracking and status polling |
-| Review Table | Browse, search, and filter classified items with inline detail panels |
+| Review Table | Browse, search, and filter classified items with inline detail panels. Duplicates filter for items sharing container-item IDs |
 | Proposed Threads | Review LLM-suggested threads with accept, reject, merge, and remap actions |
 | Entity Browser | Explore extracted entities with merge support, suggested merges, and single-name resolution |
 | Cluster Explorer | Interactive scatter plot with zoom/pan, dot hover/click for item details, cluster selection with highlighting and detail panel |
@@ -94,9 +94,10 @@ Segments are narrative units made of scenes, detected via black-slug analysis. B
 - `detect_black_slugs()` — analyzes already-extracted keyframe JPEGs using OpenCV luminance (threshold 10/255, min duration 0.5s). No video re-scan needed.
 - `build_segments()` — detects slugs, tags scenes with `black_slug`, groups consecutive non-slug scenes into `content` segments and slug scenes into `boundary` segments. Auto-numbers content segments sequentially ("Segment 1", "Segment 2", ...) and names boundary segments "Boundary".
 - `rename_segment()` — rename a segment's display name.
+- `assign_item_to_segment()` — link a catalog item to a segment (1:1). Stores `item_id` on the segment object in `scenes.json`.
 - `clear_segments()` — removes segment grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved.
 - On-demand, not automatic — user triggers detection from the UI after reviewing scenes.
-- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `type` (`content`/`boundary`), `name`, `scene_ids`, `start`, `end`. Scene `tags` array is per-scene metadata.
+- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `type` (`content`/`boundary`), `name`, `item_id` (optional catalog link), `scene_ids`, `start`, `end`. Scene `tags` array is per-scene metadata.
 
 **Transcript editing** (`pipeline/video/router.py`)
 
@@ -131,6 +132,7 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 - `POST /videos/{video_id}/scenes/trim` — trim a scene at a timestamp, adjacent scene absorbs the trimmed portion
 - `POST /videos/{video_id}/segments/detect` — detect black slugs and group scenes into segments
 - `PATCH /videos/{video_id}/segments/{segment_id}/rename` — rename a segment
+- `PATCH /videos/{video_id}/segments/{segment_id}/assign-item` — assign a catalog item_id to a segment (or `null` to unassign)
 - `DELETE /videos/{video_id}/segments` — clear all segment grouping data (preserves scene tags)
 - `POST /videos/{video_id}/segments/{segment_id}/analyze` — kick off VLM analysis in background thread, returns `{ status: "started" }`
 - `GET /videos/{video_id}/segments/{segment_id}/analyze/status` — poll VLM job status (`running` → `completed` / `failed`)
@@ -143,12 +145,14 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 Two-level master-detail navigation:
 
 - **Level 1 — Video list**: Run Ingest form + Ingested Videos list. Click a video to drill in.
-- **Level 2 — Scene browser**: Side-by-side layout with back navigation.
-  - **Left panel (55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and segment type filter (All/Content/Boundary with counts) for isolating segments. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, scene count, and time range. Merge action bar at bottom.
-  - **Right panel (45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check.
+- **Level 2 — Scene browser**: Three-column layout with back navigation.
+  - **Catalog column (20%, toggleable)**: Lists catalog items from `items.json` matching the current video by filename. Each item shows ID, segment assignment badge, description, duration, and classification thread badges. Filter toggle (All/Assigned/Unassigned) for tracking catalog-to-segment linking progress.
+  - **Center column (38–55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and segment type filter (All/Content/Boundary with counts) for isolating segments. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, catalog item assignment button, scene count, and time range. Merge action bar at bottom. Toggleable **transcript view** replaces the scene list with full scrollable transcript (cleaned/raw toggle, re-clean, click-to-seek), with Scene/Full Video mode switch.
+  - **Right panel (42–45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check. In Full Video transcript mode, shows unclamped video player with live transcript captions overlaid.
   - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
-  - Click segment header → collapse/expand + segment preview; "Detect Segments" / "Clear Segments" button in header; ✦ VLM analyze button on content segments opens inline prompt editor
+  - Click segment header → collapse/expand + segment preview; "Detect Segments" / "Clear Segments" button in header; ✦ VLM analyze button on content segments opens inline prompt editor; catalog item assign button on content segments opens dropdown picker
   - **VLM Analysis panel**: Toggle in segment detail view. Shows full analysis text, model/timestamp metadata, prompt used (collapsible), and re-analyze button. Purple dot indicator on segment bar when analysis exists.
+  - **Catalog item assignment**: 1:1 link between content segments and catalog items. Assign via dropdown on segment header; assigned item shows as maize badge. Catalog column shows reverse reference (segment name on assigned items). Already-assigned items greyed out in picker.
   - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
   - "Apply All Merges" button appears when pending merges exist
 
@@ -167,15 +171,17 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 
 | Area | Status |
 |---|---|
-| Sidebar restructure (collapsible Catalog Classifier + Video Pipeline + Utility groups) | Done |
+| Sidebar restructure (collapsible with Lucide icons, Catalog Classifier + Video Pipeline + Utility groups) | Done |
 | Backend sub-package layout (`pipeline/video/`) wired into existing FastAPI app | Done |
 | Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
 | Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
 | Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json`, merged scenes named after first constituent | Done |
 | Stage 1 scene editing — inline rename, keyframe deletion, time range editing, scene tagging, scene trimming with adjacent-scene absorption | Done |
-| Stage 1 segment detection — black-slug-based segment grouping (content/boundary), segment rename, clear segments (preserves tags), segment type filter with counts | Done |
+| Stage 1 segment detection — black-slug-based segment grouping (content/boundary), segment rename, catalog item assignment (1:1 link), clear segments (preserves tags), segment type filter with counts | Done |
 | Stage 1 transcript integration — subtitle overlay on video player, toggleable inline transcript editor with edit/delete, click-to-seek timestamps | Done |
-| Stage 1 frontend — two-level master-detail UI (video list → side-by-side scene browser with merge selection, shift-click range select, scene-scoped video player with subtitles, segment headers, keyframe grid, duration + segment filters, inline rename, tag assignment, trim buttons) | Done |
+| Stage 1 catalog cross-reference — toggleable catalog column showing items matching video by filename, segment assignment badges, assigned/unassigned filter | Done |
+| Stage 1 transcript view — full transcript in scene browser (cleaned/raw toggle, re-clean, click-to-seek), Scene/Full Video mode with live subtitle overlay on unclamped video player | Done |
+| Stage 1 frontend — three-column master-detail UI (catalog + scene list + preview, with transcript view toggle; merge selection, shift-click range select, scene-scoped video player with subtitles, segment headers, keyframe grid, duration + segment filters, inline rename, tag assignment, trim buttons) | Done |
 | Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
 | Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
 | VLM segment analysis — on-demand Gemma 4 E4B via Ollama, multimodal (keyframes + transcript + metadata), editable prompt, async background job with polling, results in segment bar + detail panel | Done |

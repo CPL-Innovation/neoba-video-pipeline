@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PageHeader } from '../../../components/PageHeader'
 import { Card } from '../../../components/Card'
 import { Button } from '../../../components/Button'
+import { Badge } from '../../../components/Badge'
+import type { SourceItem, ClassifiedItem } from '../../../lib/types'
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -35,6 +37,7 @@ interface Segment {
   segment_id: string
   type: 'content' | 'boundary'
   name: string
+  item_id?: string | null
   scene_ids: string[]
   start: number
   end: number
@@ -46,6 +49,29 @@ interface TranscriptSegment {
   start: number
   end: number
   text: string
+}
+
+interface CleanupStats {
+  applied: boolean
+  removed_count?: number
+  modified_count?: number
+  kept_count?: number
+  removed_hallucination?: number
+  removed_adjacent_duplicate?: number
+  modified_word_run_collapse?: number
+}
+
+interface FullTranscript {
+  video_id: string
+  model: string
+  language: string
+  duration: number
+  text: string
+  segments: TranscriptSegment[]
+  segments_raw?: TranscriptSegment[]
+  cleanup?: CleanupStats
+  elapsed_seconds?: number
+  status: string
 }
 
 interface MergeGroup {
@@ -502,6 +528,18 @@ export function Ingest() {
   )
   const [vlmRunning, setVlmRunning] = useState<string | null>(null)
   const [showVlmAnalysis, setShowVlmAnalysis] = useState(false)
+  const [showCatalog, setShowCatalog] = useState(false)
+  const [catalogItems, setCatalogItems] = useState<(SourceItem & { item_id: string; classification?: ClassifiedItem })[]>([])
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [assigningSegmentId, setAssigningSegmentId] = useState<string | null>(null)
+  const [catalogAssignFilter, setCatalogAssignFilter] = useState<'all' | 'assigned' | 'unassigned'>('all')
+  const [showTranscriptView, setShowTranscriptView] = useState(false)
+  const [fullTranscript, setFullTranscript] = useState<FullTranscript | null>(null)
+  const [transcriptViewMode, setTranscriptViewMode] = useState<'cleaned' | 'raw'>('cleaned')
+  const [recleaning, setRecleaning] = useState(false)
+  const [transcriptFullVideo, setTranscriptFullVideo] = useState(false)
+  const fullVideoRef = useRef<HTMLVideoElement>(null)
+  const [fullVideoTime, setFullVideoTime] = useState(0)
 
   const isRunning = status?.status === 'running'
   const previewScene = result?.scenes.find(
@@ -511,6 +549,37 @@ export function Ingest() {
     ? result?.segments?.find((c) => c.segment_id === previewSegmentId) ?? null
     : null
   const videoUrl = result ? deriveVideoUrl(result) : null
+
+  // Fetch catalog items matching this video's filename
+  useEffect(() => {
+    if (!result || (!showCatalog && !assigningSegmentId)) return
+    let cancelled = false
+    setCatalogLoading(true)
+    ;(async () => {
+      try {
+        const [srcRes, clsRes] = await Promise.all([
+          fetch('/api/source/items'),
+          fetch('/api/run/latest/classifications').catch(() => null),
+        ])
+        if (cancelled) return
+        const allItems: SourceItem[] = srcRes.ok ? await srcRes.json() : []
+        const classifications: ClassifiedItem[] =
+          clsRes && clsRes.ok ? await clsRes.json() : []
+        const classMap = new Map(classifications.map((c) => [c.item_id, c]))
+
+        const videoFilename = result.video_id // e.g. "50000000043006"
+        const matching = allItems
+          .filter((s) => s.filename?.replace(/\.[^.]+$/, '') === videoFilename)
+          .map((s) => {
+            const id = `${s.container}-${s.item}`
+            return { ...s, item_id: id, classification: classMap.get(id) }
+          })
+        if (!cancelled) setCatalogItems(matching)
+      } catch { /* ignore */ }
+      if (!cancelled) setCatalogLoading(false)
+    })()
+    return () => { cancelled = true }
+  }, [result, showCatalog, assigningSegmentId])
 
   const pendingMergeCount =
     result?.merge_groups?.filter((g) => g.status === 'pending').length ?? 0
@@ -522,6 +591,14 @@ export function Ingest() {
       for (const sid of ch.scene_ids) {
         segmentBySceneId.set(sid, ch)
       }
+    }
+  }
+
+  // Build reverse lookup: item_id → segment name
+  const itemToSegment = new Map<string, string>()
+  if (result?.segments) {
+    for (const seg of result.segments) {
+      if (seg.item_id) itemToSegment.set(seg.item_id, seg.name)
     }
   }
 
@@ -880,6 +957,48 @@ export function Ingest() {
     }
   }
 
+  const assignItemToSegment = async (segmentId: string, itemId: string | null) => {
+    if (!result) return
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/segments/${segmentId}/assign-item`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ item_id: itemId }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Assign failed' }))
+        throw new Error(err.detail || 'Assign failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setAssigningSegmentId(null)
+    }
+  }
+
+  const recleanTranscript = async () => {
+    if (!result) return
+    setRecleaning(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/video/transcribe/${result.video_id}/reclean`, { method: 'POST' })
+      if (!res.ok) throw new Error('Re-clean failed')
+      const updated = await res.json()
+      setFullTranscript(updated)
+      setTranscriptSegments(updated.segments)
+      setTranscriptViewMode('cleaned')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setRecleaning(false)
+    }
+  }
+
   const toggleSegmentCollapsed = (segmentId: string) => {
     setCollapsedSegments((prev) => {
       const next = new Set(prev)
@@ -1046,7 +1165,10 @@ export function Ingest() {
       fetch(`/api/video/videos/${id}/transcript`)
         .then((r) => (r.ok ? r.json() : null))
         .then((t) => {
-          if (t?.segments) setTranscriptSegments(t.segments)
+          if (t?.segments) {
+            setTranscriptSegments(t.segments)
+            setFullTranscript(t)
+          }
         })
         .catch(() => {})
       // Fetch valid tags
@@ -1065,6 +1187,8 @@ export function Ingest() {
     setPreviewSceneId(null)
     setPreviewSegmentId(null)
     setTranscriptSegments(null)
+    setFullTranscript(null)
+    setShowTranscriptView(false)
     clearSelection()
     setError(null)
   }
@@ -1323,6 +1447,22 @@ export function Ingest() {
               {detectingSegments ? 'Detecting…' : 'Detect Segments'}
             </Button>
           )}
+          <Button
+            onClick={() => setShowCatalog((v) => !v)}
+            variant={showCatalog ? 'primary' : 'ghost'}
+            size="sm"
+          >
+            Catalog{catalogItems.length > 0 ? ` (${catalogItems.length})` : ''}
+          </Button>
+          {fullTranscript && (
+            <Button
+              onClick={() => setShowTranscriptView((v) => !v)}
+              variant={showTranscriptView ? 'primary' : 'ghost'}
+              size="sm"
+            >
+              Transcript ({fullTranscript.segments.length})
+            </Button>
+          )}
         </div>
       </div>
 
@@ -1403,10 +1543,218 @@ export function Ingest() {
         )}
       </div>
 
-      {/* Two-column layout */}
+      {/* Main columns layout */}
       <div className="flex gap-4 flex-1 min-h-0">
-        {/* Left: Scene list */}
-        <div className="flex flex-col w-[55%] min-w-0">
+        {/* Catalog column (left) */}
+        {showCatalog && (
+          <div className="w-[20%] shrink-0 flex flex-col min-h-0 rounded-xl border border-white/6 bg-bg2 overflow-hidden">
+            <div className="px-3 py-2 border-b border-white/6 shrink-0 space-y-1.5">
+              <h3 className="text-[10px] font-medium text-text-muted uppercase tracking-wider">
+                Catalog · {catalogItems.length} items
+              </h3>
+              <div className="flex items-center gap-0.5 bg-bg3 border border-white/10 rounded overflow-hidden">
+                {(['all', 'assigned', 'unassigned'] as const).map((val) => (
+                  <button
+                    key={val}
+                    type="button"
+                    onClick={() => setCatalogAssignFilter(val)}
+                    className={`px-1.5 py-0.5 text-[10px] capitalize flex-1 ${
+                      catalogAssignFilter === val
+                        ? 'bg-white/10 text-text-primary'
+                        : 'text-text-dim hover:text-text-muted'
+                    }`}
+                  >
+                    {val}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {catalogLoading ? (
+              <p className="text-xs text-text-dim px-3 py-3">Loading…</p>
+            ) : catalogItems.length === 0 ? (
+              <p className="text-xs text-text-dim px-3 py-3">No catalog items match this video.</p>
+            ) : (
+              <div className="flex-1 overflow-y-auto">
+                {catalogItems
+                  .filter((item) => {
+                    if (catalogAssignFilter === 'assigned') return itemToSegment.has(item.item_id)
+                    if (catalogAssignFilter === 'unassigned') return !itemToSegment.has(item.item_id)
+                    return true
+                  })
+                  .map((item, idx) => (
+                  <div
+                    key={`${item.item_id}-${idx}`}
+                    className="px-3 py-2 border-b border-white/4 hover:bg-white/3"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] font-mono text-text-dim">{item.item_id}</span>
+                        {itemToSegment.has(item.item_id) && (
+                          <span className="px-1 py-0.5 rounded text-[9px] bg-maize/15 text-maize border border-maize/30 font-medium">
+                            {itemToSegment.get(item.item_id)}
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[10px] text-text-dim">{item.durationStr}</span>
+                    </div>
+                    <p className="text-xs text-text-primary mt-0.5 line-clamp-2">{item.description}</p>
+                    {item.classification?.threads && item.classification.threads.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {item.classification.threads.map((t) => (
+                          <Badge key={t.name} label={t.name} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Center column: Scene list or Transcript view */}
+        <div className={`flex flex-col min-w-0 ${showCatalog ? 'w-[38%]' : 'w-[55%]'}`}>
+        {showTranscriptView && fullTranscript ? (() => {
+          const cleanedSegs = fullTranscript.segments
+          const rawSegs = fullTranscript.segments_raw ?? fullTranscript.segments
+          const displayedSegs = transcriptViewMode === 'raw' ? rawSegs : cleanedSegs
+          const hasRaw = !!fullTranscript.segments_raw
+          const removed = fullTranscript.cleanup?.removed_count ?? 0
+          const modified = fullTranscript.cleanup?.modified_count ?? 0
+          return (
+            <div className="flex flex-col flex-1 min-h-0 rounded-xl border border-white/6 bg-bg2 overflow-hidden">
+              <div className="px-3 py-2 border-b border-white/6 shrink-0 space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-[10px] font-medium text-text-muted uppercase tracking-wider">
+                    Transcript · {cleanedSegs.length} segments
+                  </h3>
+                  <div className="flex items-center gap-1.5">
+                    {hasRaw && (
+                      <div className="inline-flex rounded border border-white/10 overflow-hidden text-[10px]">
+                        <button
+                          type="button"
+                          onClick={() => setTranscriptViewMode('cleaned')}
+                          className={`px-1.5 py-0.5 ${
+                            transcriptViewMode === 'cleaned'
+                              ? 'bg-white/10 text-maize'
+                              : 'text-text-dim hover:text-text-primary'
+                          }`}
+                        >
+                          Cleaned ({cleanedSegs.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setTranscriptViewMode('raw')}
+                          className={`px-1.5 py-0.5 border-l border-white/10 ${
+                            transcriptViewMode === 'raw'
+                              ? 'bg-white/10 text-maize'
+                              : 'text-text-dim hover:text-text-primary'
+                          }`}
+                        >
+                          Raw ({rawSegs.length})
+                        </button>
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={recleanTranscript}
+                      disabled={recleaning}
+                      className="px-1.5 py-0.5 rounded border border-white/10 text-[10px] text-text-dim hover:text-text-primary hover:bg-white/5 disabled:opacity-50 transition-colors"
+                    >
+                      {recleaning ? 'Re-cleaning…' : 'Re-clean'}
+                    </button>
+                    <div className="inline-flex rounded border border-white/10 overflow-hidden text-[10px]">
+                      <button
+                        type="button"
+                        onClick={() => setTranscriptFullVideo(false)}
+                        className={`px-1.5 py-0.5 ${
+                          !transcriptFullVideo
+                            ? 'bg-white/10 text-maize'
+                            : 'text-text-dim hover:text-text-primary'
+                        }`}
+                      >
+                        Scene
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTranscriptFullVideo(true)}
+                        className={`px-1.5 py-0.5 border-l border-white/10 ${
+                          transcriptFullVideo
+                            ? 'bg-white/10 text-maize'
+                            : 'text-text-dim hover:text-text-primary'
+                        }`}
+                      >
+                        Full Video
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <p className="text-[10px] text-text-dim">
+                  {cleanedSegs.length} segments · {fullTranscript.language}
+                  {' · '}{fmtTime(fullTranscript.duration)} · model{' '}
+                  <span className="font-mono">{fullTranscript.model}</span>
+                  {fullTranscript.elapsed_seconds != null && (
+                    <> · transcribed in {fullTranscript.elapsed_seconds.toFixed(1)}s</>
+                  )}
+                </p>
+                {fullTranscript.cleanup?.applied && (removed > 0 || modified > 0) && (
+                  <p className="text-[10px] text-text-dim">
+                    Cleanup:{' '}
+                    <span className="text-teal">{removed} removed</span>
+                    {fullTranscript.cleanup.removed_hallucination != null && (
+                      <> ({fullTranscript.cleanup.removed_hallucination} hallucination,{' '}
+                      {fullTranscript.cleanup.removed_adjacent_duplicate ?? 0} adjacent dup)</>
+                    )}
+                    {modified > 0 && (
+                      <>, <span className="text-teal">{modified} word-run collapsed</span></>
+                    )}
+                    {' · raw '}{rawSegs.length} segments
+                  </p>
+                )}
+              </div>
+              <div className="flex-1 overflow-y-auto">
+                {displayedSegs.map((seg) => (
+                  <button
+                    key={`${transcriptViewMode}-${seg.id}`}
+                    type="button"
+                    onClick={() => {
+                      if (transcriptFullVideo) {
+                        // Seek the full video player
+                        const v = fullVideoRef.current
+                        if (v) {
+                          v.currentTime = seg.start
+                          v.play().catch(() => {})
+                        }
+                      } else {
+                        // Find the scene that contains this timestamp and preview it
+                        if (result) {
+                          const scene = result.scenes.find(
+                            (s) => seg.start >= s.start && seg.start < s.end,
+                          )
+                          if (scene) {
+                            setPreviewSceneId(scene.scene_id)
+                            setPreviewSegmentId(null)
+                          }
+                        }
+                      }
+                    }}
+                    className="w-full text-left px-3 py-1.5 hover:bg-white/3 transition-colors group border-b border-white/4"
+                  >
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-[10px] font-mono text-text-dim shrink-0 tabular-nums group-hover:text-maize">
+                        {fmtTime(seg.start)}
+                      </span>
+                      <span className="text-xs text-text-primary leading-snug">
+                        {seg.text}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )
+        })() : (
+        <div className="flex flex-col flex-1 min-h-0">
           <div className="flex-1 overflow-y-auto space-y-1 pr-1">
             {(filteredScenes ?? result.scenes).map((scene) => {
               const isSelected = selectedScenes.has(scene.scene_id)
@@ -1504,6 +1852,27 @@ export function Ingest() {
                       {segment.type === 'content' && (
                         <button
                           type="button"
+                          title={segment.item_id ? `Assigned: ${segment.item_id} (click to change)` : 'Assign catalog item'}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setAssigningSegmentId(
+                              assigningSegmentId === segment.segment_id ? null : segment.segment_id
+                            )
+                          }}
+                          className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+                            segment.item_id
+                              ? 'bg-maize/15 text-maize border border-maize/30'
+                              : assigningSegmentId === segment.segment_id
+                                ? 'bg-maize/15 text-maize'
+                                : 'bg-white/5 text-text-dim hover:text-maize hover:bg-maize/10'
+                          }`}
+                        >
+                          {segment.item_id || '+'}
+                        </button>
+                      )}
+                      {segment.type === 'content' && (
+                        <button
+                          type="button"
                           title="VLM Analyze"
                           onClick={(e) => {
                             e.stopPropagation()
@@ -1526,6 +1895,52 @@ export function Ingest() {
                         </button>
                       )}
                     </div>
+                    {/* Assign catalog item dropdown */}
+                    {assigningSegmentId === segment.segment_id && catalogItems.length > 0 && (
+                      <div
+                        className="mx-2 mb-1 rounded-md border border-maize/20 bg-bg3 overflow-hidden"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="px-2 py-1 border-b border-white/6 flex items-center justify-between">
+                          <span className="text-[10px] text-text-muted uppercase tracking-wider">Assign catalog item</span>
+                          {segment.item_id && (
+                            <button
+                              type="button"
+                              onClick={() => assignItemToSegment(segment.segment_id, null)}
+                              className="text-[10px] text-coral hover:text-coral/80"
+                            >
+                              Unassign
+                            </button>
+                          )}
+                        </div>
+                        <div className="max-h-32 overflow-y-auto">
+                          {catalogItems.map((item, idx) => {
+                            const alreadyAssigned = itemToSegment.has(item.item_id) && itemToSegment.get(item.item_id) !== segment.name
+                            return (
+                              <button
+                                key={`${item.item_id}-${idx}`}
+                                type="button"
+                                disabled={alreadyAssigned}
+                                onClick={() => assignItemToSegment(segment.segment_id, item.item_id)}
+                                className={`w-full text-left px-2 py-1 text-xs flex items-center gap-2 transition-colors ${
+                                  segment.item_id === item.item_id
+                                    ? 'bg-maize/10 text-maize'
+                                    : alreadyAssigned
+                                      ? 'text-text-dim/40 cursor-not-allowed'
+                                      : 'text-text-muted hover:bg-white/5 hover:text-text-primary'
+                                }`}
+                              >
+                                <span className="font-mono text-[10px] w-10 shrink-0">{item.item_id}</span>
+                                <span className="truncate flex-1">{item.description}</span>
+                                {alreadyAssigned && (
+                                  <span className="text-[9px] text-text-dim shrink-0">{itemToSegment.get(item.item_id)}</span>
+                                )}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
                     {/* VLM prompt editor */}
                     {vlmPromptSegmentId === segment.segment_id && (
                       <div
@@ -1757,10 +2172,50 @@ export function Ingest() {
             </div>
           )}
         </div>
+        )}
+        </div>
 
         {/* Right: Preview panel */}
-        <div className="w-[45%] shrink-0 flex flex-col min-h-0">
-          {previewSegment ? (() => {
+        <div className={`${showCatalog ? 'w-[42%]' : 'w-[45%]'} shrink-0 flex flex-col min-h-0`}>
+          {showTranscriptView && transcriptFullVideo ? (() => {
+            const segs = fullTranscript
+              ? (transcriptViewMode === 'raw'
+                  ? (fullTranscript.segments_raw ?? fullTranscript.segments)
+                  : fullTranscript.segments)
+              : []
+            const currentSub = segs.find(
+              (s) => fullVideoTime >= s.start && fullVideoTime < s.end,
+            )
+            return (
+            <div className="flex-1 overflow-y-auto bg-bg3/50 rounded-lg p-4 border border-white/5">
+              {videoUrl ? (
+                <div className="relative sticky top-0">
+                  <video
+                    ref={fullVideoRef}
+                    src={videoUrl}
+                    controls
+                    preload="metadata"
+                    className="w-full rounded border border-white/10 bg-black"
+                    onTimeUpdate={(e) => setFullVideoTime(e.currentTarget.currentTime)}
+                  />
+                  {currentSub && (
+                    <div className="absolute bottom-12 left-0 right-0 flex justify-center pointer-events-none px-4">
+                      <span className="bg-black/80 text-white text-sm px-3 py-1.5 rounded max-w-[90%] text-center leading-snug">
+                        {currentSub.text}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="w-full aspect-video rounded border border-white/10 bg-black flex items-center justify-center">
+                  <p className="text-[11px] text-text-dim italic">
+                    Source video not under public/ — preview unavailable.
+                  </p>
+                </div>
+              )}
+            </div>
+            )
+          })() : previewSegment ? (() => {
             // Segment preview mode
             const chScenes = previewSegment.scene_ids
               .map((sid) => result.scenes.find((s) => s.scene_id === sid))

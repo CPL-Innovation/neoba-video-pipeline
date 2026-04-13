@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from pipeline.video.segments import (
+    assign_item_to_segment,
     build_segments,
     clear_segments,
     rename_segment,
@@ -681,6 +682,10 @@ class SegmentDetectRequest(BaseModel):
     min_duration: float = 1.0
 
 
+class SegmentAssignItemRequest(BaseModel):
+    item_id: str | None = None
+
+
 class SegmentRenameRequest(BaseModel):
     name: str
 
@@ -710,6 +715,20 @@ async def rename_segment_endpoint(
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
         rename_segment(video_id, segment_id, req.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.patch("/videos/{video_id}/segments/{segment_id}/assign-item")
+async def assign_item_endpoint(
+    video_id: str, segment_id: str, req: SegmentAssignItemRequest
+):
+    """Assign a catalog item_id to a segment."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        assign_item_to_segment(video_id, segment_id, req.item_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)

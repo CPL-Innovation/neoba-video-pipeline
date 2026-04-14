@@ -22,6 +22,8 @@ from pipeline.video.segments import (
     build_segments,
     build_segments_from_tags,
     clear_segments,
+    create_segment,
+    move_to_segment,
     rename_segment,
     update_segment_description,
 )
@@ -206,6 +208,50 @@ async def get_ingest_status(video_id: str):
     }
 
 
+def _reconcile_segments(
+    segments: list[dict],
+    merges: dict,
+    merged_scenes: list[dict],
+) -> list[dict]:
+    """Reconcile segment scene_ids with merged scene IDs.
+
+    After merging, raw scene IDs that were absorbed into a merge group no
+    longer exist in the merged scene list.  This rewrites each segment's
+    scene_ids so they reference the group ID instead, and updates
+    start/end accordingly.  Empty segments are preserved (they still
+    render in the UI).
+    """
+    if not merges.get("groups"):
+        return segments
+
+    # raw_scene_id → merged group_id
+    raw_to_merged: dict[str, str] = {}
+    for g in merges["groups"]:
+        for sid in g["scene_ids"]:
+            raw_to_merged[sid] = g["group_id"]
+
+    merged_scene_ids = {s["scene_id"] for s in merged_scenes}
+    scene_by_id = {s["scene_id"]: s for s in merged_scenes}
+
+    reconciled: list[dict] = []
+    for seg in segments:
+        new_ids: list[str] = []
+        seen: set[str] = set()
+        for sid in seg["scene_ids"]:
+            mapped = raw_to_merged.get(sid, sid)
+            if mapped not in seen and mapped in merged_scene_ids:
+                seen.add(mapped)
+                new_ids.append(mapped)
+        seg_copy = {**seg, "scene_ids": new_ids}
+        if new_ids:
+            members = [scene_by_id[sid] for sid in new_ids if sid in scene_by_id]
+            if members:
+                seg_copy["start"] = round(min(s["start"] for s in members), 3)
+                seg_copy["end"] = round(max(s["end"] for s in members), 3)
+        reconciled.append(seg_copy)
+    return reconciled
+
+
 def _merged_scenes_response(video_id: str) -> dict:
     """Build the merged-view payload (raw scenes + applied merges)."""
     result = load_ingest_result(video_id)
@@ -213,6 +259,12 @@ def _merged_scenes_response(video_id: str) -> dict:
         raise HTTPException(404, f"No ingest output for {video_id}")
     merges = load_merges(video_id)
     merged_scenes = apply_merges(result["scenes"], merges)
+
+    # Reconcile segments with merged scene IDs
+    segments = result.get("segments")  # type: ignore[assignment]
+    if segments:
+        segments = _reconcile_segments(segments, merges, merged_scenes)
+
     response = {
         **result,
         "scenes": merged_scenes,
@@ -220,9 +272,8 @@ def _merged_scenes_response(video_id: str) -> dict:
         "raw_scene_count": result["scene_count"],
         "merge_groups": merges["groups"],
     }
-    # Pass through segment data if present
-    if "segments" in result:
-        response["segments"] = result["segments"]  # type: ignore[index]
+    if segments is not None:
+        response["segments"] = segments
     if "segment_detector" in result:
         response["segment_detector"] = result["segment_detector"]  # type: ignore[index]
     return response
@@ -399,6 +450,11 @@ async def update_scene_tags(video_id: str, req: TagsRequest):
     return _merged_scenes_response(video_id)
 
 
+class SplitRequest(BaseModel):
+    scene_id: str
+    split_point: float
+
+
 class TrimRequest(BaseModel):
     scene_id: str
     trim_point: float
@@ -458,18 +514,103 @@ async def trim_scene(video_id: str, req: TrimRequest):
     return _merged_scenes_response(video_id)
 
 
+@router.post("/videos/{video_id}/scenes/split")
+async def split_scene(video_id: str, req: SplitRequest):
+    """Split a scene into two at the given timestamp.
+
+    The original scene keeps [start, split_point] and its original ID.
+    A new scene with ID ``{original_id}_1`` is created for
+    [split_point, end].  Keyframes are distributed to the sub-scene
+    whose time range contains them.  If the scene belongs to a segment,
+    both halves remain in that segment.
+    """
+    import json as _json
+
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+
+    scenes = result["scenes"]
+    idx = next(
+        (i for i, s in enumerate(scenes) if s["scene_id"] == req.scene_id),
+        None,
+    )
+    if idx is None:
+        raise HTTPException(400, f"Unknown scene_id: {req.scene_id}")
+
+    scene = scenes[idx]
+    sp = round(req.split_point, 3)
+
+    if sp <= scene["start"] or sp >= scene["end"]:
+        raise HTTPException(
+            400, "split_point must be strictly between scene start and end"
+        )
+
+    original_id = scene["scene_id"]
+    new_id = f"{original_id}_1"
+
+    # Distribute keyframes
+    kf_before = [kf for kf in scene.get("keyframes", []) if kf["timestamp"] < sp]
+    kf_after = [kf for kf in scene.get("keyframes", []) if kf["timestamp"] >= sp]
+
+    # Update original scene → first half
+    original_end = scene["end"]
+    scene["end"] = sp
+    scene["duration"] = round(sp - scene["start"], 3)
+    scene["keyframes"] = kf_before
+
+    # Create second half
+    new_scene = {
+        "scene_id": new_id,
+        "start": sp,
+        "end": original_end,
+        "duration": round(original_end - sp, 3),
+        "keyframes": kf_after,
+    }
+    # Copy tags if present
+    if scene.get("tags"):
+        new_scene["tags"] = list(scene["tags"])
+
+    # Insert right after the original
+    scenes.insert(idx + 1, new_scene)
+    result["scene_count"] = len(scenes)
+
+    # Update segments: if the original scene belongs to a segment,
+    # insert the new scene ID right after it in that segment's scene_ids
+    segments = result.get("segments", [])
+    for seg in segments:
+        if original_id in seg["scene_ids"]:
+            pos = seg["scene_ids"].index(original_id)
+            seg["scene_ids"].insert(pos + 1, new_id)
+            # Update segment end time if needed
+            seg["end"] = round(
+                max(seg["end"], original_end), 3
+            )
+            break
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        _json.dump(result, f, indent=2)
+
+    return _merged_scenes_response(video_id)
+
+
 _TAGS_FILE = Path(__file__).resolve().parent / "tags.json"
 
 
 @router.get("/tags")
 async def get_valid_tags():
-    """Return the list of valid scene tags from tags.json."""
+    """Return pipeline config (tags and segment types) from tags.json."""
     import json as _json
 
     if not _TAGS_FILE.exists():
-        return []
+        return {"tags": [], "segment_types": []}
     with open(_TAGS_FILE) as f:
-        return _json.load(f)
+        data = _json.load(f)
+    # Backward compat: if still a plain array, wrap it
+    if isinstance(data, list):
+        return {"tags": data, "segment_types": []}
+    return data
 
 
 @router.post("/transcribe")
@@ -704,6 +845,17 @@ class SegmentDescriptionRequest(BaseModel):
     description: str
 
 
+class CreateSegmentRequest(BaseModel):
+    scene_ids: list[str]
+    name: str
+    type: str = "content"
+
+
+class MoveToSegmentRequest(BaseModel):
+    scene_ids: list[str]
+    target_segment_id: str
+
+
 @router.post("/videos/{video_id}/segments/detect")
 async def detect_segments(video_id: str, req: SegmentDetectRequest):
     """Detect black slugs and group scenes into segments."""
@@ -781,6 +933,40 @@ async def clear_segments_endpoint(video_id: str):
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
         clear_segments(video_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.post("/videos/{video_id}/segments/create")
+async def create_segment_endpoint(video_id: str, req: CreateSegmentRequest):
+    """Create a new segment from specific scene IDs.
+
+    Scenes must be unsegmented or belong to boundary segments. If they
+    belong to a boundary segment, they are removed from it. The new
+    segment is inserted at the correct position and all subsequent
+    segment indices are shifted.
+    """
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        create_segment(video_id, req.scene_ids, req.name, req.type)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.post("/videos/{video_id}/segments/move")
+async def move_to_segment_endpoint(video_id: str, req: MoveToSegmentRequest):
+    """Move scenes into an existing segment.
+
+    Scenes are extracted from their current segment (splitting if needed)
+    and inserted into the target segment at the correct timestamp position.
+    """
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        move_to_segment(video_id, req.scene_ids, req.target_segment_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)

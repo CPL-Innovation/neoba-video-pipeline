@@ -33,10 +33,15 @@ interface VlmAnalysis {
   analyzed_at: string
 }
 
+interface SegmentType {
+  value: string
+  label: string
+}
+
 interface Segment {
   segment_id: string
   segment_index?: number
-  type: 'content' | 'boundary'
+  type: string
   name: string
   description?: string
   item_id?: string | null
@@ -593,15 +598,24 @@ export function Ingest() {
   const [collapsedSegments, setCollapsedSegments] = useState<Set<string>>(
     new Set(),
   )
-  const [segmentFilter, setSegmentFilter] = useState<
-    'all' | 'content' | 'boundary'
-  >('all')
+  const [segmentFilter, setSegmentFilter] = useState<string>('all')
   const [previewSegmentId, setPreviewSegmentId] = useState<string | null>(null)
   const [transcriptSegments, setTranscriptSegments] = useState<
     TranscriptSegment[] | null
   >(null)
   const [showTranscript, setShowTranscript] = useState(false)
   const [validTags, setValidTags] = useState<string[]>([])
+  const [segmentTypes, setSegmentTypes] = useState<SegmentType[]>([
+    { value: 'content', label: 'Content' },
+    { value: 'boundary', label: 'Boundary' },
+  ])
+  const [showMoveSegmentModal, setShowMoveSegmentModal] = useState(false)
+  const [moveSegmentSceneIds, setMoveSegmentSceneIds] = useState<string[]>([])
+  const [moveTargetSegmentId, setMoveTargetSegmentId] = useState<string | null>(null)
+  const [moveShowCreateNew, setMoveShowCreateNew] = useState(false)
+  const [moveNewSegName, setMoveNewSegName] = useState('')
+  const [moveNewSegType, setMoveNewSegType] = useState('content')
+  const [movingSeg, setMovingSeg] = useState(false)
   const [currentPlaybackTime, setCurrentPlaybackTime] = useState<number | null>(
     null,
   )
@@ -782,12 +796,13 @@ export function Ingest() {
     const last = result.scenes[positions[positions.length - 1]]
     const contiguous =
       positions[positions.length - 1] - positions[0] === positions.length - 1
+    const orderedIds = positions.map((i) => ids[i])
     return {
       count: positions.length,
       contiguous,
       start: first.start,
       end: last.end,
-      orderedIds: positions.map((i) => ids[i]),
+      orderedIds,
     }
   })()
 
@@ -1347,10 +1362,18 @@ export function Ingest() {
           }
         })
         .catch(() => {})
-      // Fetch valid tags
+      // Fetch valid tags + segment types config
       fetch('/api/video/tags')
-        .then((r) => (r.ok ? r.json() : []))
-        .then(setValidTags)
+        .then((r) => (r.ok ? r.json() : { tags: [], segment_types: [] }))
+        .then((data) => {
+          // Backward compat: if still a plain array
+          if (Array.isArray(data)) {
+            setValidTags(data)
+          } else {
+            setValidTags(data.tags ?? [])
+            if (data.segment_types?.length) setSegmentTypes(data.segment_types)
+          }
+        })
         .catch(() => {})
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1736,7 +1759,7 @@ export function Ingest() {
           <>
             <span className="text-xs text-text-muted ml-2">Segment:</span>
             <div className="flex items-center gap-0.5 bg-bg3 border border-white/10 rounded overflow-hidden">
-              {(['all', 'content', 'boundary'] as const).map((val) => {
+              {[{ value: 'all', label: 'All' }, ...segmentTypes].map(({ value: val, label }) => {
                 const count =
                   val === 'all'
                     ? result.segments?.length ?? 0
@@ -1746,13 +1769,13 @@ export function Ingest() {
                     key={val}
                     type="button"
                     onClick={() => setSegmentFilter(val)}
-                    className={`px-2 py-1 text-xs capitalize ${
+                    className={`px-2 py-1 text-xs ${
                       segmentFilter === val
                         ? 'bg-white/10 text-text-primary'
                         : 'text-text-dim hover:text-text-muted'
                     }`}
                   >
-                    {val}{' '}
+                    {label}{' '}
                     <span className="tabular-nums opacity-60">{count}</span>
                   </button>
                 )
@@ -1993,7 +2016,72 @@ export function Ingest() {
         })() : (
         <div className="flex flex-col flex-1 min-h-0">
           <div className="flex-1 overflow-y-auto space-y-1 pr-1">
-            {(filteredScenes ?? result.scenes).map((scene) => {
+            {(() => {
+              // Build set of empty segments (0 scenes in merged view) to render
+              const emptySegments = (result.segments ?? []).filter(
+                (seg) => seg.scene_ids.length === 0
+              )
+              // Track which empty segments have been rendered, keyed by segment_id
+              const renderedEmpty = new Set<string>()
+
+              const scenesToRender = filteredScenes ?? result.scenes
+              const items: React.ReactNode[] = []
+
+              for (const scene of scenesToRender) {
+                // Before rendering this scene, inject any empty segments
+                // whose start time is <= this scene's start and haven't been rendered yet
+                for (const eSeg of emptySegments) {
+                  if (!renderedEmpty.has(eSeg.segment_id) && eSeg.start <= scene.start) {
+                    renderedEmpty.add(eSeg.segment_id)
+                    const eIsCollapsed = collapsedSegments.has(eSeg.segment_id)
+                    items.push(
+                      <div key={eSeg.segment_id}>
+                        <div
+                          className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
+                            previewSegmentId === eSeg.segment_id ? 'ring-1 ring-maize/40 ' : ''
+                          }${
+                            eSeg.type === 'boundary'
+                              ? 'border-white/5 bg-white/[0.02] hover:bg-white/[0.04]'
+                              : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.06]'
+                          }`}
+                          onClick={() => {
+                            toggleSegmentCollapsed(eSeg.segment_id)
+                            setPreviewSegmentId(eSeg.segment_id)
+                            setPreviewSceneId(null)
+                          }}
+                        >
+                          <span className="text-text-dim text-[10px] leading-none shrink-0 w-4 text-center">
+                            {eIsCollapsed ? '▸' : '▾'}
+                          </span>
+                          <span className="text-xs font-medium text-text-primary truncate flex-1">
+                            {eSeg.segment_index != null && (
+                              <span className="text-text-dim font-mono mr-1">S{eSeg.segment_index}</span>
+                            )}
+                            {eSeg.name}
+                          </span>
+                          <span className="text-[10px] text-text-dim font-mono shrink-0">
+                            {eSeg.segment_id.split('_').pop()}
+                          </span>
+                          <span
+                            className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
+                              eSeg.type === 'boundary'
+                                ? 'bg-white/5 text-text-dim'
+                                : 'bg-teal/10 text-teal'
+                            }`}
+                          >
+                            {eSeg.type}
+                          </span>
+                          <span className="text-[10px] text-text-dim shrink-0 tabular-nums">
+                            0 scenes
+                            {' · '}
+                            {fmtTime(eSeg.start)}→{fmtTime(eSeg.end)}
+                          </span>
+                        </div>
+                      </div>
+                    )
+                  }
+                }
+
               const isSelected = selectedScenes.has(scene.scene_id)
               const isPreviewing = previewSceneId === scene.scene_id
               const isMerged = (scene.merged_from?.length ?? 0) > 0
@@ -2003,16 +2091,16 @@ export function Ingest() {
               const hasBlackSlug = scene.tags?.includes('black_slug')
 
               // Segment header: render before the first scene in each segment
-              const segment =segmentBySceneId.get(scene.scene_id)
+              const segment = segmentBySceneId.get(scene.scene_id)
               const isFirstInSegment =
                 segment && segment.scene_ids[0] === scene.scene_id
               const isCollapsed =
                 segment && collapsedSegments.has(segment.segment_id)
 
               // If this scene's segment is collapsed and it's not the first scene, skip
-              if (segment && !isFirstInSegment && isCollapsed) return null
+              if (segment && !isFirstInSegment && isCollapsed) { continue }
 
-              return (
+              items.push(
                 <div key={scene.scene_id}>
                   {/* Segment header */}
                   {isFirstInSegment && segment && (<>
@@ -2389,7 +2477,56 @@ export function Ingest() {
                   )}
                 </div>
               )
-            })}
+              }
+
+              // Render any remaining empty segments after the last scene
+              for (const eSeg of emptySegments) {
+                if (!renderedEmpty.has(eSeg.segment_id)) {
+                  renderedEmpty.add(eSeg.segment_id)
+                  items.push(
+                    <div key={eSeg.segment_id}>
+                      <div
+                        className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
+                          previewSegmentId === eSeg.segment_id ? 'ring-1 ring-maize/40 ' : ''
+                        }${
+                          eSeg.type === 'boundary'
+                            ? 'border-white/5 bg-white/[0.02] hover:bg-white/[0.04]'
+                            : 'border-white/10 bg-white/[0.04] hover:bg-white/[0.06]'
+                        }`}
+                        onClick={() => {
+                          toggleSegmentCollapsed(eSeg.segment_id)
+                          setPreviewSegmentId(eSeg.segment_id)
+                          setPreviewSceneId(null)
+                        }}
+                      >
+                        <span className="text-text-dim text-[10px] leading-none shrink-0 w-4 text-center">▾</span>
+                        <span className="text-xs font-medium text-text-primary truncate flex-1">
+                          {eSeg.segment_index != null && (
+                            <span className="text-text-dim font-mono mr-1">S{eSeg.segment_index}</span>
+                          )}
+                          {eSeg.name}
+                        </span>
+                        <span className="text-[10px] text-text-dim font-mono shrink-0">
+                          {eSeg.segment_id.split('_').pop()}
+                        </span>
+                        <span
+                          className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
+                            eSeg.type === 'boundary' ? 'bg-white/5 text-text-dim' : 'bg-teal/10 text-teal'
+                          }`}
+                        >
+                          {eSeg.type}
+                        </span>
+                        <span className="text-[10px] text-text-dim shrink-0 tabular-nums">
+                          0 scenes · {fmtTime(eSeg.start)}→{fmtTime(eSeg.end)}
+                        </span>
+                      </div>
+                    </div>
+                  )
+                }
+              }
+
+              return items
+            })()}
           </div>
 
           {/* Merge action bar — sticky at bottom of scene list */}
@@ -2419,6 +2556,25 @@ export function Ingest() {
               >
                 Clear
               </button>
+              {selectionInfo.contiguous && result.segments && (
+                <Button
+                  onClick={() => {
+                    setMoveSegmentSceneIds(selectionInfo.orderedIds)
+                    setMoveTargetSegmentId(null)
+                    setMoveShowCreateNew(false)
+                    setMoveNewSegName('')
+                    setMoveNewSegType('content')
+                    setShowMoveSegmentModal(true)
+                  }}
+                  disabled={movingSeg}
+                  size="sm"
+                  variant="ghost"
+                >
+                  {movingSeg
+                    ? 'Moving…'
+                    : `Move ${selectionInfo.count} to segment`}
+                </Button>
+              )}
               <Button
                 onClick={mergeSelected}
                 disabled={
@@ -3100,6 +3256,42 @@ export function Ingest() {
                     >
                       Trim from here ({fmtTime(currentPlaybackTime)})
                     </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setError(null)
+                        try {
+                          const res = await fetch(
+                            `/api/video/videos/${result.video_id}/scenes/split`,
+                            {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                scene_id: previewScene.scene_id,
+                                split_point: currentPlaybackTime,
+                              }),
+                            },
+                          )
+                          if (!res.ok) {
+                            const err = await res
+                              .json()
+                              .catch(() => ({ detail: 'Split failed' }))
+                            throw new Error(err.detail || 'Split failed')
+                          }
+                          const updated = await res.json()
+                          setResult(updated)
+                          // Preview the first half after split
+                          setPreviewSceneId(previewScene.scene_id)
+                        } catch (e) {
+                          setError(
+                            e instanceof Error ? e.message : String(e),
+                          )
+                        }
+                      }}
+                      className="text-xs px-2 py-1 rounded border border-white/10 text-text-dim hover:text-text-muted hover:border-white/20"
+                    >
+                      Split at {fmtTime(currentPlaybackTime)}
+                    </button>
                   </div>
                 )}
 
@@ -3420,6 +3612,198 @@ export function Ingest() {
               >
                 Clear All Segments
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Move to Segment modal */}
+      {showMoveSegmentModal && moveSegmentSceneIds.length > 0 && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowMoveSegmentModal(false)}
+        >
+          <div
+            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-md p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-medium text-text-primary">
+              Move to Segment
+            </h3>
+            <p className="text-xs text-text-dim">
+              Move {moveSegmentSceneIds.length} scene
+              {moveSegmentSceneIds.length === 1 ? '' : 's'} into an existing
+              segment or create a new one.
+            </p>
+
+            {/* Segment list */}
+            <div className="max-h-52 overflow-y-auto rounded border border-white/10 bg-bg3">
+              {(result.segments ?? [])
+                .slice()
+                .sort((a, b) => (a.segment_index ?? 0) - (b.segment_index ?? 0))
+                .map((seg) => {
+                  const isSelected = moveTargetSegmentId === seg.segment_id && !moveShowCreateNew
+                  return (
+                    <button
+                      key={seg.segment_id}
+                      type="button"
+                      onClick={() => {
+                        setMoveTargetSegmentId(seg.segment_id)
+                        setMoveShowCreateNew(false)
+                      }}
+                      className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 transition-colors border-b border-white/5 last:border-0 ${
+                        isSelected
+                          ? 'bg-maize/10 text-maize'
+                          : 'text-text-muted hover:bg-white/5 hover:text-text-primary'
+                      }`}
+                    >
+                      <span className="font-mono text-[10px] text-text-dim w-6 shrink-0">
+                        S{seg.segment_index}
+                      </span>
+                      <span className="truncate flex-1">{seg.name}</span>
+                      <span
+                        className={`shrink-0 px-1 py-0.5 rounded text-[9px] uppercase tracking-wide ${
+                          seg.type === 'boundary'
+                            ? 'bg-white/5 text-text-dim'
+                            : 'bg-teal/10 text-teal'
+                        }`}
+                      >
+                        {seg.type}
+                      </span>
+                      <span className="text-[10px] text-text-dim shrink-0 tabular-nums">
+                        {seg.scene_ids.length}
+                      </span>
+                    </button>
+                  )
+                })}
+            </div>
+
+            {/* Create new segment option */}
+            <div className="rounded border border-white/10 bg-bg3 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => {
+                  setMoveShowCreateNew(!moveShowCreateNew)
+                  setMoveTargetSegmentId(null)
+                  if (!moveNewSegName) {
+                    const contentCount = (result.segments ?? []).filter(
+                      (s) => s.type === 'content',
+                    ).length
+                    setMoveNewSegName(`Segment ${contentCount + 1}`)
+                  }
+                }}
+                className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 transition-colors ${
+                  moveShowCreateNew
+                    ? 'bg-teal/10 text-teal'
+                    : 'text-text-muted hover:bg-white/5 hover:text-text-primary'
+                }`}
+              >
+                <span className="text-sm leading-none">+</span>
+                <span>Create new segment</span>
+              </button>
+              {moveShowCreateNew && (
+                <div className="px-3 py-2.5 space-y-2.5 border-t border-white/5">
+                  <div>
+                    <label className="text-[10px] text-text-muted block mb-1">Name</label>
+                    <input
+                      type="text"
+                      value={moveNewSegName}
+                      onChange={(e) => setMoveNewSegName(e.target.value)}
+                      placeholder="e.g. Interview B"
+                      autoFocus
+                      className="w-full bg-bg2 border border-white/10 rounded px-2 py-1.5 text-xs text-text-primary focus:outline-none focus:border-maize/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-text-muted block mb-1">Type</label>
+                    <select
+                      value={moveNewSegType}
+                      onChange={(e) => setMoveNewSegType(e.target.value)}
+                      className="w-full bg-bg2 border border-white/10 rounded px-2 py-1.5 text-xs text-text-primary focus:outline-none focus:border-maize/50"
+                    >
+                      {segmentTypes.map((st) => (
+                        <option key={st.value} value={st.value}>
+                          {st.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowMoveSegmentModal(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={
+                  movingSeg ||
+                  (!moveTargetSegmentId && !moveShowCreateNew) ||
+                  (moveShowCreateNew && !moveNewSegName.trim())
+                }
+                onClick={async () => {
+                  if (!result) return
+                  setMovingSeg(true)
+                  setError(null)
+                  try {
+                    let res: Response
+                    if (moveShowCreateNew) {
+                      // Create new segment
+                      res = await fetch(
+                        `/api/video/videos/${result.video_id}/segments/create`,
+                        {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            scene_ids: moveSegmentSceneIds,
+                            name: moveNewSegName.trim(),
+                            type: moveNewSegType,
+                          }),
+                        },
+                      )
+                    } else {
+                      // Move into existing segment
+                      res = await fetch(
+                        `/api/video/videos/${result.video_id}/segments/move`,
+                        {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            scene_ids: moveSegmentSceneIds,
+                            target_segment_id: moveTargetSegmentId,
+                          }),
+                        },
+                      )
+                    }
+                    if (!res.ok) {
+                      const err = await res
+                        .json()
+                        .catch(() => ({ detail: 'Failed' }))
+                      throw new Error(err.detail || 'Move failed')
+                    }
+                    setResult(await res.json())
+                    setShowMoveSegmentModal(false)
+                    setMoveSegmentSceneIds([])
+                    clearSelection()
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e))
+                  } finally {
+                    setMovingSeg(false)
+                  }
+                }}
+              >
+                {movingSeg
+                  ? 'Moving…'
+                  : moveShowCreateNew
+                    ? 'Create & Move'
+                    : 'Move'}
+              </Button>
             </div>
           </div>
         </div>

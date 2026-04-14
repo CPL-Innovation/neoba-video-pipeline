@@ -1,12 +1,18 @@
-[
-  "black_slug",
-  "interview",
-  "b_roll",
-  "title_card",
-  "graphics",
-  "archival",
-  "music",
-  "narration",
-  "crowd",
-  "establishing_shot"
-]
+{
+  "tags": [
+    "black_slug",
+    "interview",
+    "b_roll",
+    "title_card",
+    "graphics",
+    "archival",
+    "music",
+    "narration",
+    "crowd",
+    "establishing_shot"
+  ],
+  "segment_types": [
+    { "value": "content", "label": "Content" },
+    { "value": "boundary", "label": "Boundary" }
+  ]
+}

@@ -78,6 +78,7 @@ Key design points:
 - Committed groups are frozen — cannot be absorbed or unmerged
 - Contiguity validation: only adjacent scenes in the raw scene list can be merged
 - v1→v2 migration: old sidecars without status fields default to "committed"
+- Segment reconciliation: when the merged-scenes view is assembled, the `segments` array is rewritten to reference the surviving merged scene IDs. Previously, merges that crossed segment boundaries could leave orphan scenes outside any segment — fixed by `_reconcile_segments()` which remaps each segment's `scene_ids` / `start` / `end` through the merge groups before returning the response.
 
 **Scene editing** (`pipeline/video/ingest.py`, `pipeline/video/router.py`)
 
@@ -86,6 +87,7 @@ Key design points:
 - **Time range editing**: Double-click a scene's time range in the scene list to edit start/end times inline. Changes persist immediately to `scenes.json`.
 - **Scene tagging**: Assign tags to scenes from a configurable valid-tags list (`pipeline/video/tags.json`). Tags appear as badges in the scene list and as a dropdown selector in the preview panel. Tags persist to `scenes.json`.
 - **Scene trimming**: Pause the video at any point inside a scene, then use "Trim to here" (keep beginning) or "Trim from here" (keep end). The adjacent scene automatically absorbs the trimmed portion to maintain continuity — no gaps between scenes.
+- **Scene splitting**: Pause the video inside a scene and click "Split here" to divide it at the current playback time. The first half keeps the original scene ID; the second half gets a `{id}_1` suffix. Keyframes are distributed to whichever half their timestamp falls into (and each half is guaranteed at least one keyframe — a fallback is extracted if needed). Both halves remain in the same segment. Persists immediately to `scenes.json`.
 
 **Segment detection** (`pipeline/video/segments.py`)
 
@@ -98,8 +100,11 @@ Segments are narrative units made of scenes, detected via black-slug analysis. B
 - `update_segment_description()` — update a segment's description field. Persists to `scenes.json`.
 - `assign_item_to_segment()` — link a catalog item to a segment (1:1). Stores `item_id` on the segment object in `scenes.json`.
 - `clear_segments()` — removes segment grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved. Requires user confirmation via modal.
+- `create_segment()` — pulls a set of scenes (by ID) out of wherever they live (unsegmented, or in one or more existing content segments) and wraps them in a new segment. If scenes are extracted from the middle of a source segment, the remainder is split into multiple segments with `(1)` / `(2)` suffixes so every run of remaining scenes stays contiguous. All `segment_index` / `segment_id` values are reassigned sequentially after the operation.
+- `move_to_segment()` — same extraction logic as `create_segment`, but instead of making a new segment it inserts the pulled scenes into an existing target segment by timestamp order and auto-updates that target's `start` / `end`.
+- **Empty segment rendering**: the frontend scene list interleaves segment headers with scenes by start time so segments with zero `scene_ids` still show up as headers (useful during extraction / move flows where a source segment can momentarily end up empty before being collapsed).
 - On-demand, not automatic — user triggers detection from a modal offering two methods: scene analysis (luminance) or by existing slug tags.
-- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `segment_index`, `type` (`content`/`boundary`), `name`, `description` (editable, auto-populated from VLM), `item_id` (optional catalog link), `scene_ids`, `start`, `end`, `vlm_analysis` (optional). Scene `tags` array is per-scene metadata.
+- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `segment_index`, `type` (`content`/`boundary`, configurable via `tags.json`), `name`, `description` (editable, auto-populated from VLM), `item_id` (optional catalog link), `scene_ids`, `start`, `end`, `vlm_analysis` (optional). Scene `tags` array is per-scene metadata.
 
 **Transcript editing** (`pipeline/video/router.py`)
 
@@ -137,18 +142,21 @@ On-demand visual understanding of segments via Ollama multimodal models. A modul
 - `PATCH /videos/{video_id}/scenes/time-range` — update a scene's start/end times
 - `PATCH /videos/{video_id}/scenes/tags` — set scene tags from valid tags list
 - `POST /videos/{video_id}/scenes/trim` — trim a scene at a timestamp, adjacent scene absorbs the trimmed portion
+- `POST /videos/{video_id}/scenes/split` — split a scene at a timestamp; first half keeps original ID, second half becomes `{id}_1`, keyframes distributed by timestamp
 - `POST /videos/{video_id}/segments/detect` — detect black slugs via luminance analysis and group scenes into segments
 - `POST /videos/{video_id}/segments/detect-from-tags` — detect segments using existing `black_slug` tags as dividers
 - `PATCH /videos/{video_id}/segments/{segment_id}/rename` — rename a segment
 - `PATCH /videos/{video_id}/segments/{segment_id}/description` — update a segment's description
 - `PATCH /videos/{video_id}/segments/{segment_id}/assign-item` — assign a catalog item_id to a segment (or `null` to unassign)
 - `DELETE /videos/{video_id}/segments` — clear all segment grouping data (preserves scene tags)
+- `POST /videos/{video_id}/segments/create` — create a new segment from a set of scene IDs, extracting them from existing segments if needed (splitting source segments into `(1)` / `(2)` remainders when pulled from the middle)
+- `POST /videos/{video_id}/segments/move` — move a set of scene IDs into an existing target segment; target's `start` / `end` auto-update and scenes are inserted in timestamp order
 - `POST /videos/{video_id}/segments/{segment_id}/analyze` — kick off VLM analysis in background thread, returns `{ status: "started" }`
 - `GET /videos/{video_id}/segments/{segment_id}/analyze/status` — poll VLM job status (`running` → `completed` / `failed`)
 - `GET /video-list` — merged list of all source videos cross-referenced with ingested runs (scene/transcript status per video)
 - `POST /ingest-pipeline` — combined scene detection + transcription in one background thread, with checkboxes to control which steps run
 - `GET /ingest-pipeline/{video_id}/status` — unified progress polling for the combined pipeline
-- `GET /tags` — list valid scene tags from `pipeline/video/tags.json`
+- `GET /tags` — list valid scene tags and segment types from `pipeline/video/tags.json` (shape: `{ tags: string[], segment_types: { value, label }[] }`, with backward-compat if the file is still a plain array)
 - `PATCH /videos/{video_id}/transcript/segments` — edit or delete transcript segments
 - `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
 
@@ -163,8 +171,8 @@ Two-level master-detail navigation:
 - **Level 1 — Unified video list**: Single table showing all source videos cross-referenced with ingested runs. Each row shows filename, size, scene count, transcript segment count, and an action button (View if fully ingested, Ingest with checkboxes for scene detection/transcription, or Transcribe if only scenes exist). Inline progress bar during ingest showing phase labels (probing → detecting → extracting → transcribing → completed).
 - **Level 2 — Scene browser**: Three-column layout with back navigation.
   - **Catalog column (20%, toggleable)**: Lists catalog items from `items.json` matching the current video by filename. Each item shows ID, segment assignment badge, description, duration, and classification thread badges. Filter toggle (All/Assigned/Unassigned) for tracking catalog-to-segment linking progress.
-  - **Center column (38–55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and segment type filter (All/Content/Boundary with counts) for isolating segments. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, catalog item assignment button, scene count, and time range. Merge action bar at bottom. Toggleable **transcript view** replaces the scene list with full scrollable transcript (cleaned/raw toggle, re-clean, click-to-seek), with Scene/Full Video mode switch.
-  - **Right panel (42–45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check. In Full Video transcript mode, shows unclamped video player with live transcript captions overlaid.
+  - **Center column (38–55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Duration filter (min/max seconds) and segment type filter (dynamic from `tags.json` `segment_types`, with counts) for isolating segments. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, catalog item assignment button, scene count, and time range. Empty segments (zero scenes) still render as headers so move/extract flows stay visible. Merge action bar at bottom includes "Move N to segment…" action that opens a modal listing all existing segments (sorted by index, with badge + count) plus an inline-expanding "+ Create new segment" option (name + type inputs) — moving into an existing segment inserts by timestamp, creating a new segment drops it into the correct index slot. Toggleable **transcript view** replaces the scene list with full scrollable transcript (cleaned/raw toggle, re-clean, click-to-seek), with Scene/Full Video mode switch.
+  - **Right panel (42–45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim + split buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check. In Full Video transcript mode, shows unclamped video player with live transcript captions overlaid.
   - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
   - Click segment header → collapse/expand + segment preview; "Detect Segments" opens a modal with two methods (luminance analysis or by existing slug tags); "Clear Segments" requires confirmation modal warning about data loss; ✦ VLM analyze button on content segments opens inline prompt editor; catalog item assign button on content segments opens dropdown picker. Segment headers display "S{index}" prefix (e.g. "S1 Segment 1").
   - **VLM Analysis panel**: Toggle in segment detail view. Shows full analysis text, model/timestamp metadata, prompt used (collapsible), and re-analyze button. Purple dot indicator on segment bar when analysis exists. "Include catalog context" checkbox controls whether linked catalog item metadata is appended to the prompt. "Preview full prompt" toggle shows the final prompt including any catalog context. VLM prompt settings gear icon opens a modal to edit the global default prompt, with "Save as Default" (persists to disk) and "Apply to All" (also resets per-segment overrides).
@@ -192,8 +200,10 @@ Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidenc
 | Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
 | Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
 | Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json`, merged scenes named after first constituent | Done |
-| Stage 1 scene editing — inline rename, keyframe deletion, time range editing, scene tagging, scene trimming with adjacent-scene absorption | Done |
-| Stage 1 segment detection — black-slug-based segment grouping (dual criterion: luminance + std deviation), detection modal (by scene analysis or by existing tags), segment index numbering, segment rename, catalog item assignment (1:1 link), clear segments with confirmation modal, segment type filter with counts | Done |
+| Stage 1 scene editing — inline rename, keyframe deletion, time range editing, scene tagging, scene trimming with adjacent-scene absorption, scene splitting at playback time (keyframes distributed by timestamp) | Done |
+| Stage 1 segment detection — black-slug-based segment grouping (dual criterion: luminance + std deviation), detection modal (by scene analysis or by existing tags), segment index numbering, segment rename, catalog item assignment (1:1 link), clear segments with confirmation modal, segment type filter with counts, empty-segment header rendering, merge-segment reconciliation so cross-segment merges no longer orphan scenes | Done |
+| Stage 1 segment editing — "Move N to segment" action with existing-segment list or inline create-new, extraction from source segments (with contiguous-remainder splitting into `(1)` / `(2)`), sequential `segment_index` / `segment_id` reassignment | Done |
+| Stage 1 config — `pipeline/video/tags.json` carries both scene tags and `segment_types` (content / boundary) in a single `{ tags, segment_types }` shape, consumed by the frontend filter and the create/move segment modal | Done |
 | Stage 1 transcript integration — subtitle overlay on video player, toggleable inline transcript editor with edit/delete, click-to-seek timestamps | Done |
 | Stage 1 catalog cross-reference — toggleable catalog column showing items matching video by filename, segment assignment badges, assigned/unassigned filter | Done |
 | Stage 1 transcript view — full transcript in scene browser (cleaned/raw toggle, re-clean, click-to-seek), Scene/Full Video mode with live subtitle overlay on unclamped video player | Done |

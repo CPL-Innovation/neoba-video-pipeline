@@ -350,6 +350,298 @@ def update_segment_description(
     return result
 
 
+def create_segment(
+    video_id: str,
+    scene_ids: list[str],
+    name: str,
+    segment_type: str = "content",
+) -> IngestResult:
+    """Create a new segment from the given scene IDs.
+
+    The new segment is inserted at the correct position (by start time)
+    among existing segments.  segment_index values for all subsequent
+    segments are shifted up to make room.  Scenes are extracted from
+    whatever segment they currently belong to (the source segment is
+    kept, possibly empty).  If extracting scenes from the middle of an
+    existing content segment, the source is split into up to two
+    remainder segments that keep the original name with "(1)" / "(2)"
+    suffixes.
+    """
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    # Work on merged view to validate scene_ids
+    merges = load_merges(video_id)
+    scenes = apply_merges(result["scenes"], merges)
+    scene_map = {s["scene_id"]: s for s in scenes}
+
+    # Also build a map back to raw IDs for storage
+    group_by_id = {g["group_id"]: g for g in merges["groups"]}
+    raw_scene_ids: list[str] = []
+    for sid in scene_ids:
+        if sid in group_by_id:
+            raw_scene_ids.extend(group_by_id[sid]["scene_ids"])
+        elif sid in scene_map:
+            raw_scene_ids.append(sid)
+        else:
+            raise ValueError(f"Unknown scene_id: {sid}")
+
+    segments: list[Segment] = result.get("segments", [])  # type: ignore[assignment]
+
+    # Remove extracted scenes from their current segments.
+    # If we cut scenes from the middle of a segment, split it into two
+    # remainder segments so scenes before and after the cut stay grouped.
+    extract_set = set(raw_scene_ids)
+    new_segments: list[Segment] = []
+    for seg in segments:
+        remaining = [sid for sid in seg["scene_ids"] if sid not in extract_set]
+        if len(remaining) == len(seg["scene_ids"]):
+            # Segment untouched
+            new_segments.append(seg)
+            continue
+
+        if not remaining:
+            # All scenes extracted → keep as empty segment
+            seg["scene_ids"] = []
+            new_segments.append(seg)
+            continue
+
+        # Check if the remaining scenes are contiguous in the original
+        # segment order.  If not, we need to split into runs.
+        original_order = seg["scene_ids"]
+        remaining_set = set(remaining)
+        runs: list[list[str]] = []
+        current_run: list[str] = []
+        for sid in original_order:
+            if sid in remaining_set:
+                current_run.append(sid)
+            else:
+                if current_run:
+                    runs.append(current_run)
+                    current_run = []
+        if current_run:
+            runs.append(current_run)
+
+        if len(runs) == 1:
+            # Contiguous remainder — just update the segment
+            seg["scene_ids"] = runs[0]
+            # Update start/end from raw scene data
+            raw_scenes = result["scenes"]
+            raw_map = {s["scene_id"]: s for s in raw_scenes}
+            members = [raw_map[sid] for sid in runs[0] if sid in raw_map]
+            if members:
+                seg["start"] = round(min(s["start"] for s in members), 3)
+                seg["end"] = round(max(s["end"] for s in members), 3)
+            new_segments.append(seg)
+        else:
+            # Split into multiple remainder segments
+            raw_scenes = result["scenes"]
+            raw_map = {s["scene_id"]: s for s in raw_scenes}
+            for ri, run in enumerate(runs):
+                members = [raw_map[sid] for sid in run if sid in raw_map]
+                suffix = f" ({ri + 1})" if len(runs) > 1 else ""
+                split_seg: Segment = {
+                    "segment_id": seg["segment_id"],  # will be reassigned below
+                    "segment_index": seg["segment_index"],  # will be reassigned
+                    "type": seg["type"],
+                    "name": f"{seg['name']}{suffix}",
+                    "scene_ids": run,
+                    "start": round(min(s["start"] for s in members), 3) if members else seg["start"],
+                    "end": round(max(s["end"] for s in members), 3) if members else seg["end"],
+                }
+                # Preserve optional fields from original
+                if seg.get("description"):
+                    split_seg["description"] = seg["description"]  # type: ignore[typeddict-unknown-key]
+                if seg.get("item_id"):
+                    split_seg["item_id"] = seg["item_id"]  # type: ignore[typeddict-unknown-key]
+                new_segments.append(split_seg)
+
+    segments = new_segments
+
+    # Determine insertion position by start time of first scene
+    member_scenes_merged = [scene_map[sid] for sid in scene_ids if sid in scene_map]
+    if not member_scenes_merged:
+        raise ValueError("No valid scenes provided")
+    new_start = round(min(s["start"] for s in member_scenes_merged), 3)
+    new_end = round(max(s["end"] for s in member_scenes_merged), 3)
+
+    # Find the right insertion index (sorted by start time)
+    insert_idx = 0
+    for i, seg in enumerate(segments):
+        if seg["start"] <= new_start:
+            insert_idx = i + 1
+
+    new_segment: Segment = {
+        "segment_id": "",  # assigned below
+        "segment_index": 0,  # assigned below
+        "type": segment_type,
+        "name": name,
+        "scene_ids": raw_scene_ids,
+        "start": new_start,
+        "end": new_end,
+    }
+
+    segments.insert(insert_idx, new_segment)
+
+    # Reassign all segment_index / segment_id values sequentially.
+    # This handles splits that created extra segments and ensures
+    # monotonic indices with no gaps or duplicates.
+    for i, seg in enumerate(segments):
+        seg["segment_index"] = i + 1
+        seg["segment_id"] = f"{video_id}_segment_{i + 1:03d}"
+    result["segments"] = segments  # type: ignore[typeddict-unknown-key]
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+
+def move_to_segment(
+    video_id: str,
+    scene_ids: list[str],
+    target_segment_id: str,
+) -> IngestResult:
+    """Move scenes into an existing segment.
+
+    Scenes are extracted from their current segment (splitting it if
+    needed) and inserted into the target segment at the correct position
+    by timestamp.  The target segment's start/end are updated to
+    encompass the new scenes.
+    """
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    merges = load_merges(video_id)
+    scenes = apply_merges(result["scenes"], merges)
+    scene_map = {s["scene_id"]: s for s in scenes}
+
+    # Expand merged group IDs to raw scene IDs
+    group_by_id = {g["group_id"]: g for g in merges["groups"]}
+    raw_scene_ids: list[str] = []
+    for sid in scene_ids:
+        if sid in group_by_id:
+            raw_scene_ids.extend(group_by_id[sid]["scene_ids"])
+        elif sid in scene_map:
+            raw_scene_ids.append(sid)
+        else:
+            raise ValueError(f"Unknown scene_id: {sid}")
+
+    segments: list[Segment] = result.get("segments", [])  # type: ignore[assignment]
+
+    # Find target segment
+    target = next(
+        (s for s in segments if s["segment_id"] == target_segment_id), None
+    )
+    if target is None:
+        raise ValueError(f"Unknown segment_id: {target_segment_id}")
+
+    # Don't extract from the target itself
+    extract_set = set(raw_scene_ids)
+    if any(sid in extract_set for sid in target["scene_ids"]):
+        # Remove any that are already in target from extract_set
+        already_in_target = set(target["scene_ids"]) & extract_set
+        extract_set -= already_in_target
+        raw_scene_ids = [sid for sid in raw_scene_ids if sid not in already_in_target]
+
+    if not raw_scene_ids:
+        # All scenes already in target — nothing to do
+        run_dir = VIDEO_RUNS_DIR / video_id
+        with open(run_dir / "scenes.json", "w") as f:
+            json.dump(result, f, indent=2)
+        return result
+
+    # Extract scenes from source segments (same logic as create_segment)
+    new_segments: list[Segment] = []
+    for seg in segments:
+        if seg is target:
+            new_segments.append(seg)
+            continue
+        remaining = [sid for sid in seg["scene_ids"] if sid not in extract_set]
+        if len(remaining) == len(seg["scene_ids"]):
+            new_segments.append(seg)
+            continue
+
+        if not remaining:
+            seg["scene_ids"] = []
+            new_segments.append(seg)
+            continue
+
+        # Check contiguity of remaining scenes
+        original_order = seg["scene_ids"]
+        remaining_set = set(remaining)
+        runs: list[list[str]] = []
+        current_run: list[str] = []
+        for sid in original_order:
+            if sid in remaining_set:
+                current_run.append(sid)
+            else:
+                if current_run:
+                    runs.append(current_run)
+                    current_run = []
+        if current_run:
+            runs.append(current_run)
+
+        raw_scenes = result["scenes"]
+        raw_map = {s["scene_id"]: s for s in raw_scenes}
+
+        if len(runs) == 1:
+            seg["scene_ids"] = runs[0]
+            members = [raw_map[sid] for sid in runs[0] if sid in raw_map]
+            if members:
+                seg["start"] = round(min(s["start"] for s in members), 3)
+                seg["end"] = round(max(s["end"] for s in members), 3)
+            new_segments.append(seg)
+        else:
+            for ri, run in enumerate(runs):
+                members = [raw_map[sid] for sid in run if sid in raw_map]
+                suffix = f" ({ri + 1})" if len(runs) > 1 else ""
+                split_seg: Segment = {
+                    "segment_id": seg["segment_id"],
+                    "segment_index": seg["segment_index"],
+                    "type": seg["type"],
+                    "name": f"{seg['name']}{suffix}",
+                    "scene_ids": run,
+                    "start": round(min(s["start"] for s in members), 3) if members else seg["start"],
+                    "end": round(max(s["end"] for s in members), 3) if members else seg["end"],
+                }
+                if seg.get("description"):
+                    split_seg["description"] = seg["description"]  # type: ignore[typeddict-unknown-key]
+                if seg.get("item_id"):
+                    split_seg["item_id"] = seg["item_id"]  # type: ignore[typeddict-unknown-key]
+                new_segments.append(split_seg)
+
+    segments = new_segments
+
+    # Insert scenes into target by timestamp order
+    raw_scenes = result["scenes"]
+    raw_map = {s["scene_id"]: s for s in raw_scenes}
+    combined = list(target["scene_ids"]) + raw_scene_ids
+    combined.sort(key=lambda sid: raw_map[sid]["start"] if sid in raw_map else 0)
+    target["scene_ids"] = combined
+
+    # Update target start/end
+    all_members = [raw_map[sid] for sid in combined if sid in raw_map]
+    if all_members:
+        target["start"] = round(min(s["start"] for s in all_members), 3)
+        target["end"] = round(max(s["end"] for s in all_members), 3)
+
+    # Reassign all segment indices sequentially
+    result["segments"] = segments  # type: ignore[typeddict-unknown-key]
+    for i, seg in enumerate(segments):
+        seg["segment_index"] = i + 1
+        seg["segment_id"] = f"{video_id}_segment_{i + 1:03d}"
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+
 def clear_segments(video_id: str) -> IngestResult:
     """Remove segment grouping data from scenes.json. Scene tags are preserved."""
     result = load_ingest_result(video_id)

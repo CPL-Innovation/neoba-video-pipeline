@@ -33,6 +33,9 @@ from pipeline.video.ingest import (
     apply_merges,
     derive_video_id,
     list_ingested_videos,
+    load_notes,
+    get_note,
+    set_note,
     list_source_videos,
     load_ingest_result,
     load_merges,
@@ -831,6 +834,11 @@ async def get_keyframe(video_id: str, filename: str):
 class SegmentDetectRequest(BaseModel):
     luminance_threshold: float = 30
     min_duration: float = 0.5
+    auto_merge_black_slugs: bool = True
+
+
+class SegmentDetectFromTagsRequest(BaseModel):
+    auto_merge_black_slugs: bool = True
 
 
 class SegmentAssignItemRequest(BaseModel):
@@ -866,6 +874,7 @@ async def detect_segments(video_id: str, req: SegmentDetectRequest):
             video_id,
             luminance_threshold=req.luminance_threshold,
             min_duration=req.min_duration,
+            auto_merge_black_slugs=req.auto_merge_black_slugs,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -873,12 +882,17 @@ async def detect_segments(video_id: str, req: SegmentDetectRequest):
 
 
 @router.post("/videos/{video_id}/segments/detect-from-tags")
-async def detect_segments_from_tags(video_id: str):
+async def detect_segments_from_tags(
+    video_id: str, req: SegmentDetectFromTagsRequest
+):
     """Build segments using existing black_slug tags as dividers."""
     if load_ingest_result(video_id) is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
-        build_segments_from_tags(video_id)
+        build_segments_from_tags(
+            video_id,
+            auto_merge_black_slugs=req.auto_merge_black_slugs,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)
@@ -1077,6 +1091,7 @@ async def get_video_list():
     """
     source_videos = list_source_videos()
     ingested = list_ingested_videos()
+    notes = load_notes()
 
     ingested_map: dict[str, dict] = {v["video_id"]: v for v in ingested}
 
@@ -1093,11 +1108,13 @@ async def get_video_list():
             "name": sv["name"],
             "relative_path": sv["relative_path"],
             "size_bytes": sv["size_bytes"],
+            "duration": None,
             "video_id": vid,
             "has_scenes": False,
             "scene_count": None,
             "has_transcript": False,
             "transcript_segment_count": None,
+            "note": notes.get(vid, ""),
         }
         if ing:
             entry["has_scenes"] = ing.get("status") == "completed" or (
@@ -1109,6 +1126,7 @@ async def get_video_list():
             entry["transcript_segment_count"] = ing.get(
                 "transcript_segment_count"
             )
+            entry["duration"] = ing.get("duration")
         out.append(entry)
 
     # Orphans: ingested videos whose source file no longer exists
@@ -1130,10 +1148,29 @@ async def get_video_list():
                     "transcript_segment_count": ing.get(
                         "transcript_segment_count"
                     ),
+                    "duration": ing.get("duration"),
+                    "note": notes.get(vid, ""),
                 }
             )
 
     return out
+
+
+class VideoNoteRequest(BaseModel):
+    note: str = ""
+
+
+@router.patch("/videos/{video_id}/note")
+async def update_video_note(video_id: str, req: VideoNoteRequest):
+    """Save or clear a reviewer note for a video. Works for any video_id,
+    whether or not it has been ingested yet."""
+    saved = set_note(video_id, req.note)
+    return {"video_id": video_id, "note": saved}
+
+
+@router.get("/videos/{video_id}/note")
+async def get_video_note(video_id: str):
+    return {"video_id": video_id, "note": get_note(video_id)}
 
 
 # ── Combined ingest pipeline ──────────────────────────────────────────

@@ -459,6 +459,44 @@ def public_relative_path(src: Path) -> str | None:
         return None
 
 
+# ── Reviewer notes ────────────────────────────────────────────────────
+# Notes live in a single JSON file keyed by video_id so we can attach a
+# note to any video — whether or not it has been ingested yet. Using a
+# single file (instead of per-video sidecars) avoids creating stub run
+# dirs for videos that haven't been processed.
+NOTES_FILE = VIDEO_RUNS_DIR / "_notes.json"
+
+
+def load_notes() -> dict[str, str]:
+    if not NOTES_FILE.exists():
+        return {}
+    try:
+        with open(NOTES_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: str(v) for k, v in data.items() if v}
+    except Exception:
+        return {}
+    return {}
+
+
+def get_note(video_id: str) -> str:
+    return load_notes().get(video_id, "")
+
+
+def set_note(video_id: str, note: str) -> str:
+    notes = load_notes()
+    note = (note or "").strip()
+    if note:
+        notes[video_id] = note
+    else:
+        notes.pop(video_id, None)
+    NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(NOTES_FILE, "w") as f:
+        json.dump(notes, f, indent=2)
+    return note
+
+
 def list_source_videos() -> list[dict]:
     """List videos available under public/data/source/videos/."""
     if not SOURCE_VIDEOS_DIR.exists():

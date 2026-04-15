@@ -9,6 +9,7 @@ to detect slugs and group scenes into segments.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import TypedDict
 
@@ -18,8 +19,10 @@ import numpy as np
 from pipeline.video.ingest import (
     VIDEO_RUNS_DIR,
     IngestResult,
+    MergesSidecar,
     load_ingest_result,
     load_merges,
+    save_merges,
     apply_merges,
 )
 
@@ -105,11 +108,114 @@ def detect_black_slugs(
     return slug_ids
 
 
+def _auto_merge_adjacent_black_slugs(
+    video_id: str,
+    result: IngestResult,
+    merges: MergesSidecar,
+) -> None:
+    """Merge runs of 2+ adjacent black_slug scenes into a single merged scene.
+
+    Operates after `black_slug` tags are written to raw scenes. For each run,
+    keeps only the earliest keyframe (by timestamp) across all member scenes;
+    all other keyframe images are deleted from disk and removed from their
+    scene entries. The merge group is recorded as *committed* in merges.json.
+
+    Mutates `result["scenes"]` and `merges["groups"]` in place. Callers must
+    persist both. No-op when no adjacent slug runs exist.
+    """
+    raw_by_id: dict[str, dict] = {s["scene_id"]: s for s in result["scenes"]}
+
+    # Walk the merged view and find runs of 2+ consecutive slug scenes.
+    # Convention: merged scenes carry the first member's scene_id, and tags
+    # live on raw scenes — a merged scene is a "slug" when its owning first
+    # raw scene has the black_slug tag.
+    merged = apply_merges(result["scenes"], merges)
+
+    def is_slug(ms: dict) -> bool:
+        raw = raw_by_id.get(ms["scene_id"])
+        return bool(raw and "black_slug" in (raw.get("tags") or []))
+
+    runs: list[list[dict]] = []
+    current: list[dict] = []
+    for ms in merged:
+        if is_slug(ms):
+            current.append(ms)
+        else:
+            if len(current) >= 2:
+                runs.append(current)
+            current = []
+    if len(current) >= 2:
+        runs.append(current)
+
+    if not runs:
+        return
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    for run in runs:
+        # Expand each merged-view member back to raw scene IDs
+        raw_ids: list[str] = []
+        absorbed_group_ids: set[str] = set()
+        for ms in run:
+            mf = ms.get("merged_from")
+            if mf:
+                raw_ids.extend(mf)
+                absorbed_group_ids.add(ms["scene_id"])
+            else:
+                raw_ids.append(ms["scene_id"])
+
+        # Collect every keyframe across members with its owning raw scene,
+        # pick the earliest by timestamp, delete the rest from disk.
+        all_kfs: list[tuple[float, dict, str]] = []
+        for rid in raw_ids:
+            raw = raw_by_id.get(rid)
+            if not raw:
+                continue
+            for kf in raw.get("keyframes", []):
+                all_kfs.append((kf["timestamp"], kf, rid))
+
+        if not all_kfs:
+            continue
+
+        all_kfs.sort(key=lambda t: t[0])
+        kept_ts, kept_kf, kept_owner = all_kfs[0]
+
+        for _ts, kf, _owner in all_kfs[1:]:
+            img_file = run_dir / kf["path"]
+            if img_file.exists():
+                try:
+                    img_file.unlink()
+                except OSError:
+                    pass
+
+        # Rewrite keyframes on each raw member scene
+        for rid in raw_ids:
+            raw = raw_by_id.get(rid)
+            if not raw:
+                continue
+            raw["keyframes"] = [kept_kf] if rid == kept_owner else []
+
+        # Drop any existing groups we're absorbing, append the new committed group
+        if absorbed_group_ids:
+            merges["groups"] = [
+                g for g in merges["groups"] if g["group_id"] not in absorbed_group_ids
+            ]
+        merges["groups"].append({
+            "group_id": raw_ids[0],
+            "scene_ids": raw_ids,
+            "status": "committed",
+            "created_at": now,
+            "committed_at": now,
+        })
+
+
 def build_segments(
     video_id: str,
     luminance_threshold: float = DEFAULT_LUMINANCE_THRESHOLD,
     min_duration: float = DEFAULT_MIN_DURATION,
     std_threshold: float = DEFAULT_STD_THRESHOLD,
+    auto_merge_black_slugs: bool = True,
 ) -> IngestResult:
     """Detect black slugs, tag scenes, and group them into segments.
 
@@ -125,18 +231,34 @@ def build_segments(
     )
     slug_set = set(slug_ids)
 
-    # Work on the merged view
-    merges = load_merges(video_id)
-    scenes = apply_merges(result["scenes"], merges)
-
-    # Tag scenes
-    for scene in scenes:
-        tags: list[str] = scene.get("tags", [])  # type: ignore[assignment]
-        # Remove stale black_slug tags, then re-add if applicable
-        tags = [t for t in tags if t != "black_slug"]
+    # Tag raw scenes first (merged-view scene_ids == first raw scene_id of
+    # each group, so the tag lands on the first member and propagates
+    # correctly to any subsequent merged view).
+    for scene in result["scenes"]:
+        tags: list[str] = [
+            t for t in (scene.get("tags") or []) if t != "black_slug"
+        ]
         if scene["scene_id"] in slug_set:
             tags.append("black_slug")
         scene["tags"] = tags  # type: ignore[typeddict-unknown-key]
+
+    merges = load_merges(video_id)
+
+    if auto_merge_black_slugs:
+        _auto_merge_adjacent_black_slugs(video_id, result, merges)
+        save_merges(video_id, merges)
+
+    # Rebuild the merged view after any auto-merge
+    scenes = apply_merges(result["scenes"], merges)
+
+    # Recompute slug_set against the (possibly new) merged view via tags on
+    # the first raw member scene.
+    raw_by_id = {s["scene_id"]: s for s in result["scenes"]}
+    slug_set = {
+        ms["scene_id"]
+        for ms in scenes
+        if "black_slug" in (raw_by_id.get(ms["scene_id"], {}).get("tags") or [])
+    }
 
     # Build segments by grouping consecutive scenes.
     # segment_index is a monotonic counter for unique IDs across all segments.
@@ -186,20 +308,12 @@ def build_segments(
     # Flush trailing content scenes
     flush_content()
 
-    # Also tag scenes in the raw result (scenes.json stores raw scenes)
-    raw_slug_set = slug_set
-    for scene in result["scenes"]:
-        tags = scene.get("tags", [])  # type: ignore[assignment]
-        tags = [t for t in tags if t != "black_slug"]
-        if scene["scene_id"] in raw_slug_set:
-            tags.append("black_slug")
-        scene["tags"] = tags  # type: ignore[typeddict-unknown-key]
-
     # Store segments and detector config
     result["segments"] = segments  # type: ignore[typeddict-unknown-key]
     result["segment_detector"] = {  # type: ignore[typeddict-unknown-key]
         "luminance_threshold": luminance_threshold,
         "min_duration": min_duration,
+        "auto_merged_black_slugs": bool(auto_merge_black_slugs),
     }
 
     run_dir = VIDEO_RUNS_DIR / video_id
@@ -209,7 +323,10 @@ def build_segments(
     return result
 
 
-def build_segments_from_tags(video_id: str) -> IngestResult:
+def build_segments_from_tags(
+    video_id: str,
+    auto_merge_black_slugs: bool = True,
+) -> IngestResult:
     """Build segments using existing black_slug tags as dividers.
 
     Unlike build_segments() which runs luminance analysis, this simply
@@ -221,12 +338,20 @@ def build_segments_from_tags(video_id: str) -> IngestResult:
         raise ValueError(f"No ingest output for {video_id}")
 
     merges = load_merges(video_id)
+
+    if auto_merge_black_slugs:
+        _auto_merge_adjacent_black_slugs(video_id, result, merges)
+        save_merges(video_id, merges)
+
     scenes = apply_merges(result["scenes"], merges)
 
+    # Resolve tags via the first raw member scene so merged groups inherit
+    # their members' tags without apply_merges needing to copy them.
+    raw_by_id = {s["scene_id"]: s for s in result["scenes"]}
     slug_set = {
         s["scene_id"]
         for s in scenes
-        if "black_slug" in (s.get("tags") or [])
+        if "black_slug" in (raw_by_id.get(s["scene_id"], {}).get("tags") or [])
     }
 
     segments: list[Segment] = []
@@ -274,6 +399,7 @@ def build_segments_from_tags(video_id: str) -> IngestResult:
     result["segments"] = segments  # type: ignore[typeddict-unknown-key]
     result["segment_detector"] = {  # type: ignore[typeddict-unknown-key]
         "method": "from_tags",
+        "auto_merged_black_slugs": bool(auto_merge_black_slugs),
     }
 
     run_dir = VIDEO_RUNS_DIR / video_id

@@ -109,11 +109,13 @@ interface VideoListEntry {
   name: string | null
   relative_path: string | null
   size_bytes: number | null
+  duration: number | null
   video_id: string
   has_scenes: boolean
   scene_count: number | null
   has_transcript: boolean
   transcript_segment_count: number | null
+  note?: string
 }
 
 interface PipelineStatus {
@@ -153,6 +155,16 @@ function fmtBytes(n: number): string {
 function fmtTime(seconds: number): string {
   const m = Math.floor(seconds / 60)
   const s = Math.floor(seconds % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function fmtDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = Math.floor(seconds % 60)
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  }
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
@@ -357,11 +369,17 @@ function TranscriptPanel({
   videoId,
   onUpdate,
   onSeek,
+  fillHeight = false,
+  readOnly = false,
+  onEdited,
 }: {
   segments: TranscriptSegment[]
   videoId: string
   onUpdate: (updated: TranscriptSegment[]) => void
   onSeek?: (time: number) => void
+  fillHeight?: boolean
+  readOnly?: boolean
+  onEdited?: () => void
 }) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editText, setEditText] = useState('')
@@ -399,6 +417,7 @@ function TranscriptPanel({
       if (res.ok) {
         const data = await res.json()
         onUpdate(data.segments)
+        onEdited?.()
       }
     } catch {
       /* silent */
@@ -419,6 +438,7 @@ function TranscriptPanel({
       if (res.ok) {
         const data = await res.json()
         onUpdate(data.segments)
+        onEdited?.()
       }
     } catch {
       /* silent */
@@ -439,6 +459,7 @@ function TranscriptPanel({
       if (res.ok) {
         const data = await res.json()
         onUpdate(data.segments)
+        onEdited?.()
       }
     } catch {
       /* silent */
@@ -454,7 +475,13 @@ function TranscriptPanel({
   }
 
   return (
-    <div className="space-y-1 max-h-48 overflow-y-auto">
+    <div
+      className={
+        fillHeight
+          ? 'flex-1 min-h-0 overflow-y-auto space-y-1'
+          : 'space-y-1 max-h-48 overflow-y-auto'
+      }
+    >
       {segments.map((seg) => (
         <div
           key={seg.id}
@@ -478,11 +505,12 @@ function TranscriptPanel({
                 className={onSeek ? 'text-text-muted hover:text-maize cursor-pointer' : 'text-text-dim'}
                 onClick={() => onSeek?.(seg.start)}
                 onDoubleClick={(e) => {
+                  if (readOnly) return
                   e.stopPropagation()
                   setEditingTimestamp({ id: seg.id, field: 'start' })
                   setEditTimestampValue(fmtTime(seg.start))
                 }}
-                title="Click to seek · Double-click to edit"
+                title={readOnly ? 'Click to seek' : 'Click to seek · Double-click to edit'}
               >
                 {fmtTime(seg.start)}
               </span>
@@ -505,11 +533,12 @@ function TranscriptPanel({
                 className={onSeek ? 'text-text-muted hover:text-maize cursor-pointer' : 'text-text-dim'}
                 onClick={() => onSeek?.(seg.end)}
                 onDoubleClick={(e) => {
+                  if (readOnly) return
                   e.stopPropagation()
                   setEditingTimestamp({ id: seg.id, field: 'end' })
                   setEditTimestampValue(fmtTime(seg.end))
                 }}
-                title="Click to seek · Double-click to edit"
+                title={readOnly ? 'Click to seek' : 'Click to seek · Double-click to edit'}
               >
                 {fmtTime(seg.end)}
               </span>
@@ -533,8 +562,13 @@ function TranscriptPanel({
             />
           ) : (
             <span
-              className="flex-1 text-text-muted cursor-text py-1 hover:text-text-primary"
+              className={
+                readOnly
+                  ? 'flex-1 text-text-muted py-1'
+                  : 'flex-1 text-text-muted cursor-text py-1 hover:text-text-primary'
+              }
               onClick={() => {
+                if (readOnly) return
                 setEditingId(seg.id)
                 setEditText(seg.text)
               }}
@@ -542,14 +576,16 @@ function TranscriptPanel({
               {seg.text.trim() || '(empty)'}
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => deleteSegment(seg.id)}
-            className="shrink-0 text-text-dim hover:text-coral text-xs leading-none pt-1 opacity-0 group-hover/seg:opacity-100 transition-opacity"
-            title="Delete segment"
-          >
-            ✕
-          </button>
+          {!readOnly && (
+            <button
+              type="button"
+              onClick={() => deleteSegment(seg.id)}
+              className="shrink-0 text-text-dim hover:text-coral text-xs leading-none pt-1 opacity-0 group-hover/seg:opacity-100 transition-opacity"
+              title="Delete segment"
+            >
+              ✕
+            </button>
+          )}
         </div>
       ))}
     </div>
@@ -571,6 +607,9 @@ export function Ingest() {
   const [ingestScenes, setIngestScenes] = useState(true)
   const [ingestTranscribe, setIngestTranscribe] = useState(true)
   const [customVideoId, setCustomVideoId] = useState('')
+  // Per-row note edits (local overrides before save)
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({})
+  const [savingNoteId, setSavingNoteId] = useState<string | null>(null)
 
   // Level 2 state
   const [result, setResult] = useState<IngestResult | null>(null)
@@ -591,6 +630,13 @@ export function Ingest() {
   const [detectingSegments, setDetectingSegments] = useState(false)
   const [showDetectModal, setShowDetectModal] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [showCleanUpConfirm, setShowCleanUpConfirm] = useState(false)
+  const [showActionsMenu, setShowActionsMenu] = useState(false)
+  const [autoMergeBlackSlugs, setAutoMergeBlackSlugs] = useState(true)
+  const actionsMenuRef = useRef<HTMLDivElement | null>(null)
+  const [showSceneFilterMenu, setShowSceneFilterMenu] = useState(false)
+  const [transcriptEdited, setTranscriptEdited] = useState(false)
+  const [showRecleanConfirm, setShowRecleanConfirm] = useState(false)
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null)
   const [editingSegmentName, setEditingSegmentName] = useState('')
   const [editingPreviewSegName, setEditingPreviewSegName] = useState<string | null>(null)
@@ -721,9 +767,13 @@ export function Ingest() {
 
   // Build reverse lookup: item_id → segment label (S + index)
   const itemToSegment = new Map<string, string>()
+  const itemToSegmentId = new Map<string, string>()
   if (result?.segments) {
     for (const seg of result.segments) {
-      if (seg.item_id) itemToSegment.set(seg.item_id, seg.segment_index != null ? `S${seg.segment_index}` : seg.name)
+      if (seg.item_id) {
+        itemToSegment.set(seg.item_id, seg.segment_index != null ? `S${seg.segment_index}` : seg.name)
+        itemToSegmentId.set(seg.item_id, seg.segment_id)
+      }
     }
   }
 
@@ -1017,7 +1067,7 @@ export function Ingest() {
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ auto_merge_black_slugs: autoMergeBlackSlugs }),
       })
       if (!res.ok) {
         const err = await res
@@ -1141,10 +1191,19 @@ export function Ingest() {
       setFullTranscript(updated)
       setTranscriptSegments(updated.segments)
       setTranscriptViewMode('cleaned')
+      setTranscriptEdited(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setRecleaning(false)
+    }
+  }
+
+  const requestRecleanTranscript = () => {
+    if (transcriptEdited) {
+      setShowRecleanConfirm(true)
+    } else {
+      recleanTranscript()
     }
   }
 
@@ -1155,6 +1214,26 @@ export function Ingest() {
       else next.add(segmentId)
       return next
     })
+  }
+
+  /** Expand a segment (if collapsed), select it, and scroll its header into view. */
+  const jumpToSegment = (segmentId: string) => {
+    setCollapsedSegments((prev) => {
+      if (!prev.has(segmentId)) return prev
+      const next = new Set(prev)
+      next.delete(segmentId)
+      return next
+    })
+    setPreviewSegmentId(segmentId)
+    setPreviewSceneId(null)
+    // Defer scroll until after React commits the state update & header renders.
+    // setTimeout(0) waits for the next tick after React's commit; rAF can fire too early.
+    setTimeout(() => {
+      const el = document.querySelector(
+        `[data-segment-id="${segmentId}"]`,
+      ) as HTMLElement | null
+      if (el) el.scrollIntoView({ block: 'center' })
+    }, 0)
   }
 
   /** Build the full VLM prompt for a segment, appending catalog context if linked. */
@@ -1244,6 +1323,45 @@ export function Ingest() {
       if (res.ok) setVideoList(await res.json())
     } catch {
       /* ignore */
+    }
+  }
+
+  /** Persist a reviewer note for a video. Called on blur. */
+  const saveVideoNote = async (videoId: string, note: string) => {
+    const original = videoList.find((v) => v.video_id === videoId)?.note ?? ''
+    if (note === original) {
+      // No change — clear the draft
+      setNoteDrafts((prev) => {
+        const next = { ...prev }
+        delete next[videoId]
+        return next
+      })
+      return
+    }
+    setSavingNoteId(videoId)
+    try {
+      const res = await fetch(`/api/video/videos/${videoId}/note`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setVideoList((prev) =>
+          prev.map((v) =>
+            v.video_id === videoId ? { ...v, note: data.note } : v,
+          ),
+        )
+        setNoteDrafts((prev) => {
+          const next = { ...prev }
+          delete next[videoId]
+          return next
+        })
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSavingNoteId(null)
     }
   }
 
@@ -1457,7 +1575,8 @@ export function Ingest() {
               <thead>
                 <tr className="border-b border-white/8 text-xs text-text-muted uppercase tracking-wider">
                   <th className="text-left py-2 px-3 font-medium">Video</th>
-                  <th className="text-right py-2 px-3 font-medium w-24">Size</th>
+                  <th className="text-left py-2 px-3 font-medium w-56">Note</th>
+                  <th className="text-right py-2 px-3 font-medium w-24">Duration</th>
                   <th className="text-right py-2 px-3 font-medium w-28">Scenes</th>
                   <th className="text-right py-2 px-3 font-medium w-32">Transcript</th>
                   <th className="text-right py-2 px-3 font-medium w-44">Action</th>
@@ -1489,9 +1608,44 @@ export function Ingest() {
                         )}
                       </td>
 
-                      {/* Size */}
-                      <td className="py-2.5 px-3 text-right text-xs text-text-dim font-mono tabular-nums">
-                        {entry.size_bytes != null ? fmtBytes(entry.size_bytes) : '—'}
+                      {/* Note */}
+                      <td className="py-2.5 px-3">
+                        <textarea
+                          value={noteDrafts[entry.video_id] ?? entry.note ?? ''}
+                          onChange={(e) =>
+                            setNoteDrafts((prev) => ({
+                              ...prev,
+                              [entry.video_id]: e.target.value,
+                            }))
+                          }
+                          onBlur={(e) =>
+                            saveVideoNote(entry.video_id, e.target.value.trim())
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                              e.preventDefault()
+                              ;(e.target as HTMLTextAreaElement).blur()
+                            }
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          placeholder="Add note…"
+                          rows={1}
+                          className={`w-full bg-transparent border border-transparent hover:border-white/10 focus:border-maize/50 focus:bg-bg3 rounded px-1.5 py-1 text-xs text-text-primary placeholder:text-text-dim/50 focus:outline-none resize-y min-h-[26px] ${
+                            savingNoteId === entry.video_id ? 'opacity-50' : ''
+                          }`}
+                        />
+                      </td>
+
+                      {/* Duration */}
+                      <td
+                        className="py-2.5 px-3 text-right text-xs text-text-dim font-mono tabular-nums"
+                        title={
+                          entry.size_bytes != null
+                            ? fmtBytes(entry.size_bytes)
+                            : undefined
+                        }
+                      >
+                        {entry.duration != null ? fmtDuration(entry.duration) : '—'}
                       </td>
 
                       {/* Scenes */}
@@ -1678,20 +1832,80 @@ export function Ingest() {
               {pendingMergeCount === 1 ? '' : 's'}
             </Button>
           )}
-          {result.segments && result.segments.length > 0 ? (
-            <Button onClick={() => setShowClearConfirm(true)} variant="secondary" size="sm">
-              Clear Segments
-            </Button>
-          ) : (
-            <Button
-              onClick={() => setShowDetectModal(true)}
-              disabled={detectingSegments}
-              variant="secondary"
-              size="sm"
-            >
-              {detectingSegments ? 'Detecting…' : 'Detect Segments'}
-            </Button>
-          )}
+          {(() => {
+            const hasSegments = !!(result.segments && result.segments.length > 0)
+            return (
+              <div className="relative" ref={actionsMenuRef}>
+                <Button
+                  onClick={() => setShowActionsMenu((v) => !v)}
+                  disabled={detectingSegments}
+                  variant="secondary"
+                  size="sm"
+                >
+                  {detectingSegments ? 'Detecting…' : 'Actions'}
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    style={{ marginLeft: 6, display: 'inline-block', verticalAlign: 'middle' }}
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </Button>
+                {showActionsMenu && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-40"
+                      onClick={() => setShowActionsMenu(false)}
+                    />
+                    <div className="absolute right-0 mt-1 z-50 min-w-[180px] bg-bg2 border border-white/10 rounded-md shadow-xl py-1">
+                      {!hasSegments && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowActionsMenu(false)
+                            setShowDetectModal(true)
+                          }}
+                          className="w-full text-left px-3 py-1.5 text-sm text-text-primary hover:bg-white/5"
+                        >
+                          Detect Segments
+                        </button>
+                      )}
+                      {hasSegments && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowActionsMenu(false)
+                            setShowClearConfirm(true)
+                          }}
+                          className="w-full text-left px-3 py-1.5 text-sm text-text-primary hover:bg-white/5"
+                        >
+                          Clear Segments
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={!hasSegments}
+                        onClick={() => {
+                          setShowActionsMenu(false)
+                          setShowCleanUpConfirm(true)
+                        }}
+                        className="w-full text-left px-3 py-1.5 text-sm text-text-primary hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                        title={hasSegments ? undefined : 'Available after segments are detected'}
+                      >
+                        Clean Up
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )
+          })()}
           <Button
             onClick={() => setShowCatalog((v) => !v)}
             variant={showCatalog ? 'primary' : 'ghost'}
@@ -1729,79 +1943,6 @@ export function Ingest() {
       {error && (
         <p className="text-xs text-coral break-words mb-3 shrink-0">{error}</p>
       )}
-
-      {/* Filter bar */}
-      <div className="shrink-0 mb-3 flex items-center gap-3 flex-wrap">
-        <span className="text-xs text-text-muted">Duration:</span>
-        <div className="flex items-center gap-1.5">
-          <input
-            type="number"
-            value={durationMin}
-            onChange={(e) => setDurationMin(e.target.value)}
-            placeholder="min"
-            min={0}
-            step={1}
-            className="w-16 bg-bg3 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono tabular-nums placeholder:text-text-dim/50 focus:border-maize/50 focus:outline-none"
-          />
-          <span className="text-text-dim text-xs">–</span>
-          <input
-            type="number"
-            value={durationMax}
-            onChange={(e) => setDurationMax(e.target.value)}
-            placeholder="max"
-            min={0}
-            step={1}
-            className="w-16 bg-bg3 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono tabular-nums placeholder:text-text-dim/50 focus:border-maize/50 focus:outline-none"
-          />
-          <span className="text-xs text-text-dim">sec</span>
-        </div>
-        {segmentBySceneId.size > 0 && (
-          <>
-            <span className="text-xs text-text-muted ml-2">Segment:</span>
-            <div className="flex items-center gap-0.5 bg-bg3 border border-white/10 rounded overflow-hidden">
-              {[{ value: 'all', label: 'All' }, ...segmentTypes].map(({ value: val, label }) => {
-                const count =
-                  val === 'all'
-                    ? result.segments?.length ?? 0
-                    : result.segments?.filter((c) => c.type === val).length ?? 0
-                return (
-                  <button
-                    key={val}
-                    type="button"
-                    onClick={() => setSegmentFilter(val)}
-                    className={`px-2 py-1 text-xs ${
-                      segmentFilter === val
-                        ? 'bg-white/10 text-text-primary'
-                        : 'text-text-dim hover:text-text-muted'
-                    }`}
-                  >
-                    {label}{' '}
-                    <span className="tabular-nums opacity-60">{count}</span>
-                  </button>
-                )
-              })}
-            </div>
-          </>
-        )}
-        {(hasDurationFilter || segmentFilter !== 'all') && (
-          <>
-            <span className="text-xs text-maize tabular-nums">
-              {filteredScenes?.length ?? 0} / {result.scenes.length} scenes
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                setDurationMin('')
-                setDurationMax('')
-                setSegmentFilter('all')
-              }}
-              className="text-xs text-text-dim hover:text-text-primary"
-            >
-              Clear
-            </button>
-          </>
-        )}
-      </div>
 
       {/* Main columns layout */}
       <div className="flex gap-4 flex-1 min-h-0">
@@ -1841,10 +1982,26 @@ export function Ingest() {
                     if (catalogAssignFilter === 'unassigned') return !itemToSegment.has(item.item_id)
                     return true
                   })
-                  .map((item, idx) => (
+                  .map((item, idx) => {
+                    const assignedSegmentId = itemToSegmentId.get(item.item_id)
+                    return (
                   <div
                     key={`${item.item_id}-${idx}`}
-                    className="px-3 py-2 border-b border-white/4 hover:bg-white/3"
+                    onClick={
+                      assignedSegmentId
+                        ? () => jumpToSegment(assignedSegmentId)
+                        : undefined
+                    }
+                    className={`px-3 py-2 border-b border-white/4 ${
+                      assignedSegmentId
+                        ? 'cursor-pointer hover:bg-white/5'
+                        : 'hover:bg-white/3'
+                    } ${
+                      assignedSegmentId && previewSegmentId === assignedSegmentId
+                        ? 'bg-maize/5'
+                        : ''
+                    }`}
+                    title={assignedSegmentId ? 'Jump to assigned segment' : undefined}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1.5">
@@ -1866,7 +2023,8 @@ export function Ingest() {
                       </div>
                     )}
                   </div>
-                ))}
+                    )
+                  })}
               </div>
             )}
           </div>
@@ -1917,7 +2075,7 @@ export function Ingest() {
                     )}
                     <button
                       type="button"
-                      onClick={recleanTranscript}
+                      onClick={requestRecleanTranscript}
                       disabled={recleaning}
                       className="px-1.5 py-0.5 rounded border border-white/10 text-[10px] text-text-dim hover:text-text-primary hover:bg-white/5 disabled:opacity-50 transition-colors"
                     >
@@ -1972,50 +2130,242 @@ export function Ingest() {
                   </p>
                 )}
               </div>
-              <div className="flex-1 overflow-y-auto">
-                {displayedSegs.map((seg) => (
-                  <button
-                    key={`${transcriptViewMode}-${seg.id}`}
-                    type="button"
-                    onClick={() => {
-                      if (transcriptFullVideo) {
-                        // Seek the full video player
-                        const v = fullVideoRef.current
-                        if (v) {
-                          v.currentTime = seg.start
-                          v.play().catch(() => {})
-                        }
-                      } else {
-                        // Find the scene that contains this timestamp and preview it
-                        if (result) {
-                          const scene = result.scenes.find(
-                            (s) => seg.start >= s.start && seg.start < s.end,
-                          )
-                          if (scene) {
-                            setPreviewSceneId(scene.scene_id)
-                            setPreviewSegmentId(null)
-                          }
-                        }
+              <div className="flex-1 min-h-0 flex flex-col px-3 py-2">
+                {transcriptViewMode === 'raw' && (
+                  <p className="text-[10px] text-text-dim italic mb-1.5 shrink-0">
+                    Raw segments are read-only. Switch to Cleaned to edit.
+                  </p>
+                )}
+                <TranscriptPanel
+                  key={transcriptViewMode}
+                  segments={displayedSegs}
+                  videoId={result.video_id}
+                  readOnly={transcriptViewMode === 'raw'}
+                  fillHeight
+                  onUpdate={(updated) => {
+                    setTranscriptSegments(updated)
+                    setFullTranscript((prev) =>
+                      prev ? { ...prev, segments: updated } : prev,
+                    )
+                  }}
+                  onEdited={() => setTranscriptEdited(true)}
+                  onSeek={(t) => {
+                    if (transcriptFullVideo) {
+                      const v = fullVideoRef.current
+                      if (v) {
+                        v.currentTime = t
+                        v.play().catch(() => {})
                       }
-                    }}
-                    className="w-full text-left px-3 py-1.5 hover:bg-white/3 transition-colors group border-b border-white/4"
-                  >
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-[10px] font-mono text-text-dim shrink-0 tabular-nums group-hover:text-maize">
-                        {fmtTime(seg.start)}
-                      </span>
-                      <span className="text-xs text-text-primary leading-snug">
-                        {seg.text}
-                      </span>
-                    </div>
-                  </button>
-                ))}
+                    } else if (result) {
+                      const scene = result.scenes.find(
+                        (s) => t >= s.start && t < s.end,
+                      )
+                      if (scene) {
+                        setPreviewSceneId(scene.scene_id)
+                        setPreviewSegmentId(null)
+                      }
+                    }
+                  }}
+                />
               </div>
             </div>
           )
         })() : (
-        <div className="flex flex-col flex-1 min-h-0">
-          <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+        <div className="flex flex-col flex-1 min-h-0 rounded-xl border border-white/6 bg-bg2 overflow-hidden">
+          {/* Pinned header: title + filter icon */}
+          <div className="px-3 py-2 border-b border-white/6 shrink-0 flex items-center justify-between gap-2">
+            <h3 className="text-[10px] font-medium text-text-muted uppercase tracking-wider">
+              Scenes ·{' '}
+              {(hasDurationFilter || segmentFilter !== 'all') ? (
+                <>
+                  <span className="text-maize tabular-nums">
+                    {filteredScenes?.length ?? 0}
+                  </span>
+                  <span className="text-text-dim tabular-nums"> / {result.scenes.length}</span>
+                </>
+              ) : (
+                <span className="tabular-nums">{result.scenes.length}</span>
+              )}
+            </h3>
+            <div className="flex items-center gap-1">
+              {(() => {
+                const allSegs = result.segments ?? []
+                if (allSegs.length === 0) return null
+                const allCollapsed = allSegs.every((s) =>
+                  collapsedSegments.has(s.segment_id),
+                )
+                const allExpanded = collapsedSegments.size === 0
+                return (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setCollapsedSegments(new Set())}
+                      className={`p-1 rounded border border-white/10 transition-colors ${
+                        allExpanded
+                          ? 'text-text-dim/50 hover:text-text-dim'
+                          : 'text-text-dim hover:text-text-muted hover:border-white/20'
+                      }`}
+                      title="Expand all segments"
+                    >
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <polyline points="7 13 12 18 17 13" />
+                        <polyline points="7 6 12 11 17 6" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCollapsedSegments(
+                          new Set(allSegs.map((s) => s.segment_id)),
+                        )
+                      }
+                      className={`p-1 rounded border border-white/10 transition-colors ${
+                        allCollapsed
+                          ? 'text-text-dim/50 hover:text-text-dim'
+                          : 'text-text-dim hover:text-text-muted hover:border-white/20'
+                      }`}
+                      title="Collapse all segments"
+                    >
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <polyline points="7 11 12 6 17 11" />
+                        <polyline points="7 18 12 13 17 18" />
+                      </svg>
+                    </button>
+                    <div className="w-px h-4 bg-white/10 mx-0.5" />
+                  </>
+                )
+              })()}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowSceneFilterMenu((v) => !v)}
+                className={`p-1 rounded border transition-colors relative ${
+                  hasDurationFilter || segmentFilter !== 'all'
+                    ? 'border-maize/40 text-maize bg-maize/10'
+                    : 'border-white/10 text-text-dim hover:text-text-muted hover:border-white/20'
+                }`}
+                title="Filter scenes"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+                </svg>
+                {(hasDurationFilter || segmentFilter !== 'all') && (
+                  <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-maize" />
+                )}
+              </button>
+              {showSceneFilterMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setShowSceneFilterMenu(false)}
+                  />
+                  <div className="absolute right-0 mt-1 z-50 w-72 bg-bg2 border border-white/10 rounded-md shadow-xl p-3 space-y-3">
+                    <div>
+                      <div className="text-[10px] font-medium text-text-muted uppercase tracking-wider mb-1.5">
+                        Duration
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="number"
+                          value={durationMin}
+                          onChange={(e) => setDurationMin(e.target.value)}
+                          placeholder="min"
+                          min={0}
+                          step={1}
+                          className="w-16 bg-bg3 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono tabular-nums placeholder:text-text-dim/50 focus:border-maize/50 focus:outline-none"
+                        />
+                        <span className="text-text-dim text-xs">–</span>
+                        <input
+                          type="number"
+                          value={durationMax}
+                          onChange={(e) => setDurationMax(e.target.value)}
+                          placeholder="max"
+                          min={0}
+                          step={1}
+                          className="w-16 bg-bg3 border border-white/10 rounded px-2 py-1 text-xs text-text-primary font-mono tabular-nums placeholder:text-text-dim/50 focus:border-maize/50 focus:outline-none"
+                        />
+                        <span className="text-xs text-text-dim">sec</span>
+                      </div>
+                    </div>
+                    {segmentBySceneId.size > 0 && (
+                      <div>
+                        <div className="text-[10px] font-medium text-text-muted uppercase tracking-wider mb-1.5">
+                          Segment
+                        </div>
+                        <div className="flex items-center gap-0.5 bg-bg3 border border-white/10 rounded overflow-hidden">
+                          {[{ value: 'all', label: 'All' }, ...segmentTypes].map(({ value: val, label }) => {
+                            const count =
+                              val === 'all'
+                                ? result.segments?.length ?? 0
+                                : result.segments?.filter((c) => c.type === val).length ?? 0
+                            return (
+                              <button
+                                key={val}
+                                type="button"
+                                onClick={() => setSegmentFilter(val)}
+                                className={`flex-1 px-2 py-1 text-xs ${
+                                  segmentFilter === val
+                                    ? 'bg-white/10 text-text-primary'
+                                    : 'text-text-dim hover:text-text-muted'
+                                }`}
+                              >
+                                {label}{' '}
+                                <span className="tabular-nums opacity-60">{count}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {(hasDurationFilter || segmentFilter !== 'all') && (
+                      <div className="flex justify-end pt-1 border-t border-white/5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDurationMin('')
+                            setDurationMax('')
+                            setSegmentFilter('all')
+                          }}
+                          className="text-[11px] text-text-dim hover:text-text-primary"
+                        >
+                          Clear filters
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto space-y-1 px-2 py-2">
             {(() => {
               // Build set of empty segments (0 scenes in merged view) to render
               const emptySegments = (result.segments ?? []).filter(
@@ -2037,6 +2387,7 @@ export function Ingest() {
                     items.push(
                       <div key={eSeg.segment_id}>
                         <div
+                          data-segment-id={eSeg.segment_id}
                           className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
                             previewSegmentId === eSeg.segment_id ? 'ring-1 ring-maize/40 ' : ''
                           }${
@@ -2105,6 +2456,7 @@ export function Ingest() {
                   {/* Segment header */}
                   {isFirstInSegment && segment && (<>
                     <div
+                      data-segment-id={segment.segment_id}
                       className={`flex items-center gap-2 px-2 py-1.5 mt-2 mb-1 rounded-md border cursor-pointer transition-colors ${
                         previewSegmentId === segment.segment_id
                           ? 'ring-1 ring-maize/40 '
@@ -3529,6 +3881,27 @@ export function Ingest() {
                 Choose how to identify black slug boundaries:
               </p>
 
+              <label
+                className="flex items-start gap-2 p-2.5 rounded-md border border-white/10 bg-white/3 cursor-pointer hover:border-white/20 transition-colors"
+                title="After tagging scenes as black slugs, runs of 2+ adjacent slug scenes are merged into a single scene. Only the earliest keyframe is kept; other keyframe image files are deleted from disk. The merged scene keeps the black_slug tag and becomes a single boundary segment."
+              >
+                <input
+                  type="checkbox"
+                  checked={autoMergeBlackSlugs}
+                  onChange={(e) => setAutoMergeBlackSlugs(e.target.checked)}
+                  className="mt-0.5 accent-maize"
+                />
+                <div className="flex-1">
+                  <span className="text-xs text-text-primary">
+                    Auto-merge adjacent black slugs
+                  </span>
+                  <p className="text-[11px] text-text-dim mt-0.5">
+                    Merge runs of adjacent slug scenes into one, keeping only
+                    the first keyframe (deletes the other keyframe files).
+                  </p>
+                </div>
+              </label>
+
               <div className="space-y-2">
                 <button
                   type="button"
@@ -3611,6 +3984,94 @@ export function Ingest() {
                 className="px-3 py-1.5 rounded text-xs font-medium bg-red-500/20 text-red-300 hover:bg-red-500/30 transition-colors"
               >
                 Clear All Segments
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Re-clean confirmation modal (only shown when user has edited transcript) */}
+      {showRecleanConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowRecleanConfirm(false)}
+        >
+          <div
+            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-md p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-medium text-text-primary">
+              Re-clean transcript?
+            </h3>
+            <p className="text-xs text-text-dim">
+              Re-cleaning regenerates the Cleaned segments from Raw, discarding
+              the edits you've made to text and timestamps in this session.
+              This cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowRecleanConfirm(false)}
+              >
+                Cancel
+              </Button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowRecleanConfirm(false)
+                  recleanTranscript()
+                }}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-red-500/20 text-red-300 hover:bg-red-500/30 transition-colors"
+              >
+                Discard edits & Re-clean
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clean Up confirmation modal (stub) */}
+      {showCleanUpConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowCleanUpConfirm(false)}
+        >
+          <div
+            className="bg-bg2 border border-white/10 rounded-lg shadow-xl w-full max-w-md p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-medium text-text-primary">
+              Clean Up scenes.json?
+            </h3>
+            <p className="text-xs text-text-dim">
+              Validates and normalizes <code className="text-text-primary">scenes.json</code>:
+            </p>
+            <ul className="text-xs text-text-dim list-disc list-inside space-y-1 pl-1">
+              <li>Verify every scene referenced by a segment exists</li>
+              <li>Drop orphaned scene references from segments</li>
+              <li>Reconcile segment start/end against member scene times</li>
+              <li>Remove duplicate or stale tags</li>
+              <li>Re-index segments so indices are contiguous</li>
+            </ul>
+            <p className="text-[11px] text-text-dim italic">
+              Not implemented yet — this is a placeholder action.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowCleanUpConfirm(false)}
+              >
+                Cancel
+              </Button>
+              <button
+                type="button"
+                disabled
+                className="px-3 py-1.5 rounded text-xs font-medium bg-white/5 text-text-dim cursor-not-allowed"
+                title="Not implemented yet"
+              >
+                Run Clean Up
               </button>
             </div>
           </div>

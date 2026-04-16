@@ -67,24 +67,19 @@ class IngestResult(TypedDict):
 # rewriting `scenes.json`, so the raw PySceneDetect output stays
 # reproducible.
 #
-# Two-phase workflow:
-#   1. Creating a merge produces a *pending* group — freely reversible
-#      per-item via DELETE /merges/{group_id}.
-#   2. "Apply all merges" flips every pending group to *committed*.
-#      Committed groups are frozen: cannot be unmerged, cannot be
-#      absorbed into new merges. The only way to clear them is to re-run
-#      Stage 1, which deletes the sidecar entirely.
+# Every group in the sidecar is pending: freely reversible per-item via
+# DELETE /merges/{group_id}. "Apply all merges" bakes every pending group
+# into scenes.json and clears the sidecar; the only way to undo a bake is
+# to re-run Stage 1.
 #
-# Sidecar shape (version 2):
+# Sidecar shape (version 3):
 #     {
-#       "version": 2,
+#       "version": 3,
 #       "next_group_index": 4,
 #       "groups": [
 #         { "group_id": "<vid>_group_001",
 #           "scene_ids": ["<vid>_scene_003", "<vid>_scene_004", ...],
-#           "status": "pending" | "committed",
-#           "created_at": "2026-04-11T...",
-#           "committed_at": "2026-04-11T..." }
+#           "created_at": "2026-04-11T..." }
 #       ]
 #     }
 #
@@ -93,17 +88,15 @@ class IngestResult(TypedDict):
 # with an adjacent scene, we expand the group, delete it, and create a
 # new larger pending group. This keeps the data model flat.
 #
-# Backward-compat: version 1 sidecars (no `status` field) are loaded with
-# status defaulting to "committed" so we don't silently un-freeze groups
-# that were created under the old "irreversible by default" rule.
+# Backward-compat: older sidecars may carry a `status` field (v1 had no
+# status, v2 distinguished pending/committed). On load we strip both
+# `status` and `committed_at` — every group is pending now.
 
 
 class MergeGroup(TypedDict, total=False):
     group_id: str
     scene_ids: list[str]
-    status: str  # "pending" | "committed"
     created_at: str
-    committed_at: str
 
 
 class MergesSidecar(TypedDict):
@@ -119,19 +112,18 @@ def merges_path_for(video_id: str) -> Path:
 def load_merges(video_id: str) -> MergesSidecar:
     p = merges_path_for(video_id)
     if not p.exists():
-        return {"version": 2, "next_group_index": 1, "groups": []}
+        return {"version": 3, "next_group_index": 1, "groups": []}
     with open(p) as f:
         data = json.load(f)
-    # Defensive defaults for older sidecars
-    data.setdefault("version", 1)
     data.setdefault("next_group_index", len(data.get("groups", [])) + 1)
     data.setdefault("groups", [])
-    # Migration v1 → v2: groups without a status field were created under
-    # the old "irreversible by default" rule, so treat them as committed
-    # to avoid silently un-freezing them.
+    # Migration to v3: drop any legacy status/committed_at fields. All
+    # surviving groups are treated as pending — they can be unmerged or
+    # absorbed into new merges freely.
     for g in data["groups"]:
-        g.setdefault("status", "committed")
-    data["version"] = 2
+        g.pop("status", None)
+        g.pop("committed_at", None)
+    data["version"] = 3
     return data
 
 
@@ -183,6 +175,15 @@ def apply_merges(scenes: list[Scene], merges: MergesSidecar) -> list[Scene]:
             keyframes.extend(m["keyframes"])
         keyframes.sort(key=lambda k: k["timestamp"])
 
+        # Union of member tags, preserving first-seen order.
+        tags: list[str] = []
+        seen_tags: set[str] = set()
+        for m in members:
+            for t in m.get("tags") or []:
+                if t not in seen_tags:
+                    tags.append(t)
+                    seen_tags.add(t)
+
         merged: Scene = {
             "scene_id": g["group_id"],
             "start": round(start, 3),
@@ -190,10 +191,11 @@ def apply_merges(scenes: list[Scene], merges: MergesSidecar) -> list[Scene]:
             "duration": round(end - start, 3),
             "keyframes": keyframes,
         }
-        # Extra fields for the frontend — TypedDict tolerates these at
-        # runtime, and they're written straight to JSON.
+        if tags:
+            merged["tags"] = tags
+        # Extra field for the frontend — TypedDict tolerates this at
+        # runtime, and it's written straight to JSON.
         merged["merged_from"] = list(g["scene_ids"])  # type: ignore[typeddict-unknown-key]
-        merged["merge_status"] = g.get("status", "committed")  # type: ignore[typeddict-unknown-key]
         out.append(merged)
 
     return out
@@ -217,19 +219,12 @@ def merge_scenes(video_id: str, scene_ids: list[str]) -> MergesSidecar:
     group_by_id = {g["group_id"]: g for g in merges["groups"]}
 
     # Expand any group IDs to their member raw scene IDs, and remember
-    # which existing groups will be absorbed by this merge. Committed
-    # groups are frozen — refuse to absorb them so the commit guarantee
-    # holds.
+    # which existing groups will be absorbed by this merge.
     expanded: list[str] = []
     absorbed_group_ids: set[str] = set()
     for sid in scene_ids:
         if sid in group_by_id:
             g = group_by_id[sid]
-            if g.get("status") == "committed":
-                raise ValueError(
-                    f"Cannot merge into committed group {sid}. "
-                    "Re-run scene detection to reset."
-                )
             absorbed_group_ids.add(sid)
             expanded.extend(g["scene_ids"])
         elif sid in raw_index:
@@ -255,15 +250,13 @@ def merge_scenes(video_id: str, scene_ids: list[str]) -> MergesSidecar:
     if indices != expected:
         raise ValueError("Selected scenes are not contiguous")
 
-    # Build the new group, dropping any absorbed ones. New groups always
-    # start pending — the user has to explicitly Apply all to commit.
-    # Name the merged scene after the first (smallest index) constituent
-    # scene, so merging _007 + _008 + _009 produces _007 rather than a
-    # synthetic group_NNN identifier.
+    # Build the new group, dropping any absorbed ones. Name the merged
+    # scene after the first (smallest index) constituent scene, so merging
+    # _007 + _008 + _009 produces _007 rather than a synthetic group_NNN
+    # identifier.
     new_group: MergeGroup = {
         "group_id": sorted_ids[0],
         "scene_ids": sorted_ids,
-        "status": "pending",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     merges["groups"] = [
@@ -276,18 +269,13 @@ def merge_scenes(video_id: str, scene_ids: list[str]) -> MergesSidecar:
 
 
 def unmerge_group(video_id: str, group_id: str) -> MergesSidecar:
-    """Remove a pending merge group. Committed groups cannot be unmerged."""
+    """Remove a merge group."""
     merges = load_merges(video_id)
     target = next(
         (g for g in merges["groups"] if g["group_id"] == group_id), None
     )
     if target is None:
         raise ValueError(f"Unknown group_id: {group_id}")
-    if target.get("status") != "pending":
-        raise ValueError(
-            f"Group {group_id} is committed and cannot be unmerged. "
-            "Re-run scene detection to reset."
-        )
     merges["groups"] = [
         g for g in merges["groups"] if g["group_id"] != group_id
     ]
@@ -377,9 +365,9 @@ def rename_scene(video_id: str, old_id: str, new_id: str) -> None:
 def apply_all_merges(video_id: str) -> IngestResult:
     """Bake all merge groups into scenes.json and clear the sidecar.
 
-    This is the irreversible commit step:
-      1. Fold every merge group (pending AND committed) into the scene
-         list, then overwrite scenes.json with the result.
+    This is the irreversible bake step:
+      1. Fold every pending merge group into the scene list, then
+         overwrite scenes.json with the result.
       2. Clear the groups list in merges.json.
 
     scenes.raw.json (written at ingest time) is never touched — it
@@ -403,7 +391,6 @@ def apply_all_merges(video_id: str) -> IngestResult:
     # scenes are indistinguishable from raw scenes in scenes.json.
     merged_scenes = apply_merges(result["scenes"], merges)
     for s in merged_scenes:
-        s.pop("merge_status", None)  # type: ignore[misc]
         s.pop("merged_from", None)  # type: ignore[misc]
 
     result["scenes"] = merged_scenes

@@ -26,6 +26,7 @@ from pipeline.video.segments import (
     move_to_segment,
     rename_segment,
     update_segment_description,
+    update_segment_type,
 )
 from pipeline.video.ingest import (
     VIDEO_RUNS_DIR,
@@ -304,12 +305,11 @@ async def get_scenes(video_id: str, raw: bool = False):
 async def create_merge(video_id: str, req: MergeRequest):
     """Merge a contiguous run of scenes into a pending group.
 
-    Accepts a mix of raw scene IDs and existing *pending* group IDs. The
-    combined set must be contiguous in the raw scene list. Pending groups
-    touched by the merge are absorbed into the new larger group. Committed
-    groups are frozen — attempting to merge into one returns 400. New
-    groups always start with status="pending"; call POST
-    /videos/{video_id}/merges/apply to commit them.
+    Accepts a mix of raw scene IDs and existing group IDs. The combined
+    set must be contiguous in the raw scene list. Existing groups touched
+    by the merge are absorbed into the new larger group. Call POST
+    /videos/{video_id}/merges/apply to bake all pending groups into
+    scenes.json.
     """
     if load_ingest_result(video_id) is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
@@ -322,16 +322,12 @@ async def create_merge(video_id: str, req: MergeRequest):
 
 @router.delete("/videos/{video_id}/merges/{group_id}")
 async def delete_merge(video_id: str, group_id: str):
-    """Unmerge a pending group. Committed groups cannot be unmerged."""
+    """Unmerge a pending group."""
     if load_ingest_result(video_id) is None:
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
         unmerge_group(video_id, group_id)
     except ValueError as e:
-        # "committed and cannot be unmerged" is semantically a conflict,
-        # "unknown group_id" is a 404. Cheap sniff on the message.
-        if "committed" in str(e):
-            raise HTTPException(409, str(e))
         raise HTTPException(404, str(e))
     return _merged_scenes_response(video_id)
 
@@ -853,6 +849,10 @@ class SegmentDescriptionRequest(BaseModel):
     description: str
 
 
+class SegmentTypeRequest(BaseModel):
+    type: str
+
+
 class CreateSegmentRequest(BaseModel):
     scene_ids: list[str]
     name: str
@@ -921,6 +921,20 @@ async def update_description_endpoint(
         raise HTTPException(404, f"No ingest output for {video_id}")
     try:
         update_segment_description(video_id, segment_id, req.description)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _merged_scenes_response(video_id)
+
+
+@router.patch("/videos/{video_id}/segments/{segment_id}/type")
+async def update_type_endpoint(
+    video_id: str, segment_id: str, req: SegmentTypeRequest
+):
+    """Update a segment's type (validated against tags.json segment_types)."""
+    if load_ingest_result(video_id) is None:
+        raise HTTPException(404, f"No ingest output for {video_id}")
+    try:
+        update_segment_type(video_id, segment_id, req.type)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _merged_scenes_response(video_id)

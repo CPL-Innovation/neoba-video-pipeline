@@ -21,7 +21,6 @@ interface Scene {
   duration?: number
   keyframes: Keyframe[]
   merged_from?: string[]
-  merge_status?: 'pending' | 'committed'
   tags?: string[]
 }
 
@@ -84,9 +83,7 @@ interface FullTranscript {
 interface MergeGroup {
   group_id: string
   scene_ids: string[]
-  status: 'pending' | 'committed'
   created_at: string
-  committed_at?: string
 }
 
 interface IngestResult {
@@ -646,6 +643,7 @@ export function Ingest() {
   )
   const [segmentFilter, setSegmentFilter] = useState<string>('all')
   const [previewSegmentId, setPreviewSegmentId] = useState<string | null>(null)
+  const [showSegTypeMenu, setShowSegTypeMenu] = useState(false)
   const [transcriptSegments, setTranscriptSegments] = useState<
     TranscriptSegment[] | null
   >(null)
@@ -752,8 +750,7 @@ export function Ingest() {
     return () => { cancelled = true }
   }, [result, showCatalog, assigningSegmentId])
 
-  const pendingMergeCount =
-    result?.merge_groups?.filter((g) => g.status === 'pending').length ?? 0
+  const pendingMergeCount = result?.merge_groups?.length ?? 0
 
   // Build segment lookup: scene_id → segment
   const segmentBySceneId = new Map<string, Segment>()
@@ -1154,6 +1151,28 @@ export function Ingest() {
       if (res.ok) setResult(await res.json())
     } catch { /* silent */ }
     setEditingPreviewSegName(null)
+  }
+
+  const updateSegmentType = async (segmentId: string, newType: string) => {
+    if (!result) return
+    setError(null)
+    try {
+      const res = await fetch(
+        `/api/video/videos/${result.video_id}/segments/${segmentId}/type`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: newType }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Update failed' }))
+        throw new Error(err.detail || 'Update failed')
+      }
+      setResult(await res.json())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const assignItemToSegment = async (segmentId: string, itemId: string | null) => {
@@ -1575,11 +1594,12 @@ export function Ingest() {
               <thead>
                 <tr className="border-b border-white/8 text-xs text-text-muted uppercase tracking-wider">
                   <th className="text-left py-2 px-3 font-medium">Video</th>
-                  <th className="text-left py-2 px-3 font-medium w-56">Note</th>
-                  <th className="text-right py-2 px-3 font-medium w-24">Duration</th>
-                  <th className="text-right py-2 px-3 font-medium w-28">Scenes</th>
-                  <th className="text-right py-2 px-3 font-medium w-32">Transcript</th>
-                  <th className="text-right py-2 px-3 font-medium w-44">Action</th>
+                  <th className="text-left py-2 px-3 font-medium min-w-[14rem]">Note</th>
+                  <th className="font-medium w-full" />
+                  <th className="text-right py-2 px-3 font-medium min-w-[6rem]">Duration</th>
+                  <th className="text-right py-2 px-3 font-medium min-w-[7rem]">Scenes</th>
+                  <th className="text-right py-2 px-3 font-medium min-w-[8rem]">Transcript</th>
+                  <th className="text-right py-2 px-3 font-medium min-w-[8rem]">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -1636,6 +1656,9 @@ export function Ingest() {
                         />
                       </td>
 
+                      {/* Spacer */}
+                      <td />
+
                       {/* Duration */}
                       <td
                         className="py-2.5 px-3 text-right text-xs text-text-dim font-mono tabular-nums"
@@ -1649,7 +1672,7 @@ export function Ingest() {
                       </td>
 
                       {/* Scenes */}
-                      <td className="py-2.5 px-3 text-right text-xs font-mono tabular-nums">
+                      <td className="py-2.5 px-3 text-right text-xs font-mono tabular-nums whitespace-nowrap">
                         {entry.has_scenes ? (
                           <span className="text-teal">{entry.scene_count} scenes</span>
                         ) : (
@@ -1658,7 +1681,7 @@ export function Ingest() {
                       </td>
 
                       {/* Transcript */}
-                      <td className="py-2.5 px-3 text-right text-xs font-mono tabular-nums">
+                      <td className="py-2.5 px-3 text-right text-xs font-mono tabular-nums whitespace-nowrap">
                         {entry.has_transcript ? (
                           <span className="text-teal">{entry.transcript_segment_count} segments</span>
                         ) : (
@@ -2436,8 +2459,6 @@ export function Ingest() {
               const isSelected = selectedScenes.has(scene.scene_id)
               const isPreviewing = previewSceneId === scene.scene_id
               const isMerged = (scene.merged_from?.length ?? 0) > 0
-              const isPending = isMerged && scene.merge_status === 'pending'
-              const isCommitted = isMerged && scene.merge_status !== 'pending'
               const firstKf = scene.keyframes[0]
               const hasBlackSlug = scene.tags?.includes('black_slug')
 
@@ -2751,19 +2772,10 @@ export function Ingest() {
                         )}
                         {isMerged && (
                           <span
-                            className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
-                              isCommitted
-                                ? 'bg-teal/15 text-teal'
-                                : 'bg-maize/15 text-maize'
-                            }`}
-                            title={
-                              isCommitted
-                                ? 'Committed — re-run scene detection to reset'
-                                : 'Pending — click ✕ to undo'
-                            }
+                            className="shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-maize/15 text-maize"
+                            title="Pending — click ✕ to undo"
                           >
-                            {isCommitted ? 'merged' : 'pending'} ×
-                            {scene.merged_from!.length}
+                            pending ×{scene.merged_from!.length}
                           </span>
                         )}
                         {hasBlackSlug && (
@@ -2812,7 +2824,7 @@ export function Ingest() {
                       </span>
 
                       {/* Unmerge button */}
-                      {isPending && (
+                      {isMerged && (
                         <button
                           type="button"
                           onClick={(e) => {
@@ -3077,15 +3089,71 @@ export function Ingest() {
                     {allKeyframes.length === 1 ? '' : 's'}
                   </p>
                   <div className="flex gap-1.5 flex-wrap">
-                    <span
-                      className={`px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide ${
-                        previewSegment.type === 'boundary'
-                          ? 'bg-white/5 text-text-dim'
-                          : 'bg-teal/10 text-teal'
-                      }`}
-                    >
-                      {previewSegment.type}
-                    </span>
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setShowSegTypeMenu((v) => !v)}
+                        title="Change segment type"
+                        className={`px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide inline-flex items-center gap-1 hover:brightness-125 transition ${
+                          previewSegment.type === 'boundary'
+                            ? 'bg-white/5 text-text-dim'
+                            : 'bg-teal/10 text-teal'
+                        }`}
+                      >
+                        {previewSegment.type}
+                        <svg
+                          width="8"
+                          height="8"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="opacity-70"
+                        >
+                          <polyline points="6 9 12 15 18 9" />
+                        </svg>
+                      </button>
+                      {showSegTypeMenu && (
+                        <>
+                          <div
+                            className="fixed inset-0 z-40"
+                            onClick={() => setShowSegTypeMenu(false)}
+                          />
+                          <div className="absolute left-0 mt-1 z-50 min-w-[140px] bg-bg2 border border-white/10 rounded-md shadow-xl py-1">
+                            {segmentTypes.map((st) => {
+                              const active = previewSegment.type === st.value
+                              return (
+                                <button
+                                  key={st.value}
+                                  type="button"
+                                  onClick={() => {
+                                    setShowSegTypeMenu(false)
+                                    if (!active) {
+                                      updateSegmentType(
+                                        previewSegment.segment_id,
+                                        st.value,
+                                      )
+                                    }
+                                  }}
+                                  className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center justify-between gap-2 transition-colors ${
+                                    active
+                                      ? 'text-text-primary bg-white/5'
+                                      : 'text-text-muted hover:text-text-primary hover:bg-white/3'
+                                  }`}
+                                >
+                                  <span>{st.label}</span>
+                                  {active && (
+                                    <span className="text-teal text-[10px]">✓</span>
+                                  )}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </>
+                      )}
+                    </div>
                     {!isContiguous && (
                       <span className="px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide bg-coral/15 text-coral">
                         non-contiguous

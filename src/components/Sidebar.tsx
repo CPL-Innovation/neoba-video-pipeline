@@ -83,9 +83,14 @@ export function Sidebar({ collapsed, onToggleCollapse }: { collapsed: boolean; o
     <aside className={`${collapsed ? 'w-12' : 'w-56'} shrink-0 bg-bg2 border-r border-white/6 flex flex-col transition-all duration-200`}>
       <div className={`flex items-center border-b border-white/6 ${collapsed ? 'p-2 justify-center' : 'p-5 justify-between'}`}>
         {!collapsed && (
-          <h1 className="font-serif text-lg text-text-primary leading-tight">
-            NEOBA Archive
-          </h1>
+          <div className="flex flex-col leading-tight">
+            <h1 className="font-serif text-lg text-text-primary">
+              NEOBA Archive
+            </h1>
+            <span className="text-xs text-text-dim tracking-wide mt-0.5">
+              Cleveland Public Library
+            </span>
+          </div>
         )}
         <button
           type="button"

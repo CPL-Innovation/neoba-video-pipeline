@@ -9,7 +9,6 @@ to detect slugs and group scenes into segments.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import TypedDict
 
@@ -113,15 +112,23 @@ def _auto_merge_adjacent_black_slugs(
     result: IngestResult,
     merges: MergesSidecar,
 ) -> None:
-    """Merge runs of 2+ adjacent black_slug scenes into a single merged scene.
+    """Collapse runs of 2+ adjacent black_slug scenes into a single scene.
 
     Operates after `black_slug` tags are written to raw scenes. For each run,
     keeps only the earliest keyframe (by timestamp) across all member scenes;
-    all other keyframe images are deleted from disk and removed from their
-    scene entries. The merge group is recorded as *committed* in merges.json.
+    all other keyframe images are deleted from disk. The run is baked
+    directly into `result["scenes"]`: member raw scenes are replaced by a
+    single consolidated scene at the position of the first member, spanning
+    the full time range and carrying the black_slug tag. No merge group is
+    recorded — the operation is irreversible short of re-running ingest
+    (scenes.raw.json preserves the pristine PySceneDetect output).
 
-    Mutates `result["scenes"]` and `merges["groups"]` in place. Callers must
-    persist both. No-op when no adjacent slug runs exist.
+    Any existing merge groups whose merged-view scene falls inside a slug
+    run are absorbed and dropped from `merges["groups"]`.
+
+    Mutates `result["scenes"]`, `result["scene_count"]`, and
+    `merges["groups"]` in place. Callers must persist both. No-op when no
+    adjacent slug runs exist.
     """
     raw_by_id: dict[str, dict] = {s["scene_id"]: s for s in result["scenes"]}
 
@@ -135,28 +142,41 @@ def _auto_merge_adjacent_black_slugs(
         raw = raw_by_id.get(ms["scene_id"])
         return bool(raw and "black_slug" in (raw.get("tags") or []))
 
+    # A run is "bakeable" if it has 2+ adjacent slug scenes (collapse the
+    # over-segmentation), or if it's a single slug position backed by an
+    # existing multi-member group (collapse the user/legacy merge so the
+    # slug ends up as one clean raw scene with the black_slug tag).
+    def bakeable(run: list[dict]) -> bool:
+        return len(run) >= 2 or (len(run) == 1 and bool(run[0].get("merged_from")))
+
     runs: list[list[dict]] = []
     current: list[dict] = []
     for ms in merged:
         if is_slug(ms):
             current.append(ms)
         else:
-            if len(current) >= 2:
+            if bakeable(current):
                 runs.append(current)
             current = []
-    if len(current) >= 2:
+    if bakeable(current):
         runs.append(current)
 
     if not runs:
         return
 
     run_dir = VIDEO_RUNS_DIR / video_id
-    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Build a map of consolidated replacements and the raw IDs to drop.
+    # replacements: first_raw_id -> consolidated Scene dict (placed at the
+    # position of the first member in result["scenes"]).
+    # raw_ids_to_drop: subsequent members that disappear from scenes.json.
+    replacements: dict[str, dict] = {}
+    raw_ids_to_drop: set[str] = set()
+    absorbed_group_ids: set[str] = set()
 
     for run in runs:
         # Expand each merged-view member back to raw scene IDs
         raw_ids: list[str] = []
-        absorbed_group_ids: set[str] = set()
         for ms in run:
             mf = ms.get("merged_from")
             if mf:
@@ -165,23 +185,23 @@ def _auto_merge_adjacent_black_slugs(
             else:
                 raw_ids.append(ms["scene_id"])
 
-        # Collect every keyframe across members with its owning raw scene,
-        # pick the earliest by timestamp, delete the rest from disk.
-        all_kfs: list[tuple[float, dict, str]] = []
+        # Collect every keyframe across members, pick the earliest by
+        # timestamp, delete the rest from disk.
+        all_kfs: list[tuple[float, dict]] = []
         for rid in raw_ids:
             raw = raw_by_id.get(rid)
             if not raw:
                 continue
             for kf in raw.get("keyframes", []):
-                all_kfs.append((kf["timestamp"], kf, rid))
+                all_kfs.append((kf["timestamp"], kf))
 
         if not all_kfs:
             continue
 
         all_kfs.sort(key=lambda t: t[0])
-        kept_ts, kept_kf, kept_owner = all_kfs[0]
+        _kept_ts, kept_kf = all_kfs[0]
 
-        for _ts, kf, _owner in all_kfs[1:]:
+        for _ts, kf in all_kfs[1:]:
             img_file = run_dir / kf["path"]
             if img_file.exists():
                 try:
@@ -189,25 +209,55 @@ def _auto_merge_adjacent_black_slugs(
                 except OSError:
                     pass
 
-        # Rewrite keyframes on each raw member scene
-        for rid in raw_ids:
-            raw = raw_by_id.get(rid)
-            if not raw:
-                continue
-            raw["keyframes"] = [kept_kf] if rid == kept_owner else []
+        members = [raw_by_id[rid] for rid in raw_ids if rid in raw_by_id]
+        if not members:
+            continue
 
-        # Drop any existing groups we're absorbing, append the new committed group
-        if absorbed_group_ids:
-            merges["groups"] = [
-                g for g in merges["groups"] if g["group_id"] not in absorbed_group_ids
-            ]
-        merges["groups"].append({
-            "group_id": raw_ids[0],
-            "scene_ids": raw_ids,
-            "status": "committed",
-            "created_at": now,
-            "committed_at": now,
-        })
+        start = min(m["start"] for m in members)
+        end = max(m["end"] for m in members)
+
+        # Union of tags across members (preserving order, black_slug first-seen).
+        tags: list[str] = []
+        seen_tags: set[str] = set()
+        for m in members:
+            for t in m.get("tags") or []:
+                if t not in seen_tags:
+                    tags.append(t)
+                    seen_tags.add(t)
+        if "black_slug" not in seen_tags:
+            tags.append("black_slug")
+
+        first_raw_id = raw_ids[0]
+        replacements[first_raw_id] = {
+            "scene_id": first_raw_id,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(end - start, 3),
+            "keyframes": [kept_kf],
+            "tags": tags,
+        }
+        for rid in raw_ids[1:]:
+            raw_ids_to_drop.add(rid)
+
+    # Rebuild result["scenes"] with replacements applied and dropped raws
+    # removed, preserving original order.
+    new_scenes: list[dict] = []
+    for s in result["scenes"]:
+        sid = s["scene_id"]
+        if sid in replacements:
+            new_scenes.append(replacements[sid])
+        elif sid in raw_ids_to_drop:
+            continue
+        else:
+            new_scenes.append(s)
+    result["scenes"] = new_scenes  # type: ignore[typeddict-item]
+    result["scene_count"] = len(new_scenes)
+
+    # Drop absorbed merge groups — their members no longer exist as raw scenes.
+    if absorbed_group_ids:
+        merges["groups"] = [
+            g for g in merges["groups"] if g["group_id"] not in absorbed_group_ids
+        ]
 
 
 def build_segments(
@@ -468,6 +518,51 @@ def update_segment_description(
         raise ValueError(f"Unknown segment_id: {segment_id}")
 
     target["description"] = description
+
+    run_dir = VIDEO_RUNS_DIR / video_id
+    with open(run_dir / "scenes.json", "w") as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+
+def update_segment_type(
+    video_id: str, segment_id: str, new_type: str
+) -> IngestResult:
+    """Update the type field of a segment in scenes.json.
+
+    Validates against the segment_types list in tags.json.
+    """
+    new_type = (new_type or "").strip()
+    if not new_type:
+        raise ValueError("type must be a non-empty string")
+
+    tags_file = Path(__file__).resolve().parent / "tags.json"
+    if tags_file.exists():
+        with open(tags_file) as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            valid = {
+                st.get("value")
+                for st in cfg.get("segment_types") or []
+                if isinstance(st, dict)
+            }
+            if valid and new_type not in valid:
+                raise ValueError(
+                    f"Invalid segment type: {new_type!r} "
+                    f"(allowed: {sorted(v for v in valid if v)})"
+                )
+
+    result = load_ingest_result(video_id)
+    if result is None:
+        raise ValueError(f"No ingest output for {video_id}")
+
+    segments = result.get("segments", [])  # type: ignore[assignment]
+    target = next((c for c in segments if c["segment_id"] == segment_id), None)
+    if target is None:
+        raise ValueError(f"Unknown segment_id: {segment_id}")
+
+    target["type"] = new_type
 
     run_dir = VIDEO_RUNS_DIR / video_id
     with open(run_dir / "scenes.json", "w") as f:

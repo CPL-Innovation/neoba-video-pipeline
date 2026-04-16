@@ -1,240 +1,94 @@
-# NEOBA Archive Classifier
+# NEOBA Archive Pipeline
 
-LLM-powered classification and entity extraction tool for the NEOBA (Northeast Ohio Broadcast Archives) collection. Processes 14,000+ archival news items through a three-tier pipeline: LLM classification, entity extraction, and semantic clustering.
+Archival video processing and classification tool for the [NEOBA (Northeast Ohio Broadcast Archives)](https://cpl.org) collection at Cleveland Public Library. Takes unannotated broadcast news footage and produces structured, Dublin-Core-compatible metadata — scene breakdowns, transcripts, visual analysis, thematic tags — entirely on local hardware.
 
 ## Architecture
 
-- **Frontend**: React + TypeScript + Vite + Tailwind CSS + TanStack Table
-- **Backend**: FastAPI (Python) with Claude API for classification
-- **Pipeline**: Batch classification with stop/resume support
+The system is a full-stack application with two processing tracks that share the same server, frontend shell, and dev tooling.
 
-### Frontend Views
+```
+┌─────────────────────────────────────────────────────┐
+│  React + TypeScript + Vite (port 5173)              │
+│  ┌──────────────┐  ┌──────────────────────────────┐ │
+│  │ Catalog       │  │ Video Pipeline               │ │
+│  │ Classifier    │  │ Ingest → Extract → Cluster → │ │
+│  │ (Tier 1-3)   │  │ Synthesize → Review          │ │
+│  └──────────────┘  └──────────────────────────────┘ │
+│                       /api proxy                     │
+├─────────────────────────────────────────────────────┤
+│  FastAPI + Python (port 8000)                        │
+│  ┌──────────────┐  ┌──────────────────────────────┐ │
+│  │ pipeline/     │  │ pipeline/video/              │ │
+│  │ classify.py   │  │ ingest.py, transcribe.py,    │ │
+│  │ (Claude API)  │  │ segments.py, vlm.py,         │ │
+│  │               │  │ router.py                    │ │
+│  └──────────────┘  └──────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+         │                       │
+    data/runs/catalog/     data/runs/video/<id>/
+    (classifications)      (scenes, keyframes, transcripts)
+```
 
-| View | Description |
-|------|-------------|
-| Run Classification | Execute Tier 1+2 (LLM) and Tier 3 (clustering) with real-time progress tracking and status polling |
-| Review Table | Browse, search, and filter classified items with inline detail panels. Duplicates filter for items sharing container-item IDs |
-| Proposed Threads | Review LLM-suggested threads with accept, reject, merge, and remap actions |
-| Entity Browser | Explore extracted entities with merge support, suggested merges, and single-name resolution |
-| Cluster Explorer | Interactive scatter plot with zoom/pan, dot hover/click for item details, cluster selection with highlighting and detail panel |
-| Cryptic Queue | Items flagged as cryptic for manual review, with duplicate filtering |
-| Export | Export classifications in various formats |
+### Catalog Classifier
 
-### Pipeline (Tier 1+2+3)
+LLM-powered classification of 14,000+ archival news items. Claude classifies items into thematic threads, extracts entities (people, places, organizations), and semantic clustering (TF-IDF + UMAP + HDBSCAN) groups similar items. Results are browsable, searchable, and exportable through the review UI. Entity merging supports deduplication across surface forms.
 
-1. **Tier 1+2** (LLM): Claude classifies items into threads and extracts entities (people, places, organizations, event types) in batches
-2. **Tier 3** (Clustering): TF-IDF + UMAP + HDBSCAN for semantic grouping with background job tracking and status polling
+### Video Pipeline
 
-## Video Pipeline
+A 5-stage, all-local pipeline for video content. Every stage writes non-destructive JSON sidecars alongside the source files — no original data is modified.
 
-A second processing track for archival video content, structured as a 5-stage **all-local** pipeline. Lives alongside the text classifier as a sub-package (`pipeline/video/`) and shares the same FastAPI app, dev server, and frontend shell.
+| Stage | What it does | Tools |
+|-------|-------------|-------|
+| **1. Ingest & Segment** | Detect scene boundaries, extract keyframes, extract audio, detect narrative segments via black-slug analysis | ffmpeg, PySceneDetect, keyframe luminance analysis |
+| **2. Extract** | Run specialist models on audio + keyframes | mlx-whisper (large-v3-turbo), Gemma 4 E4B / Qwen2.5-VL via Ollama, Apple Vision OCR, InsightFace |
+| **3. Cluster** | Cluster face embeddings, align transcripts to scenes, assemble per-scene fact bundles | DBSCAN (cosine similarity) |
+| **4. Synthesize** | Read fact bundles, emit Dublin-Core-compatible structured JSON | Gemma 4 26B A4B / Qwen2.5-14B via Ollama |
+| **5. Store & Review** | Persist outputs, expose for human-in-the-loop review, flag low-confidence fields | SQLite index + JSON sidecars |
 
-### Goal
+Stage 1 and portions of Stage 2 (transcription, VLM analysis) are fully implemented. Stages 3-5 have frontend route stubs and planned backend modules.
 
-Take an unannotated archival news video and produce Dublin-Core-compatible structured metadata — scene breakdown, transcripts, detected people/locations, thematic tags, timestamps — entirely on-device. The target output mirrors a March 25 Gemini cloud prototype, but every byte of NEOBA footage stays on CPL-owned hardware because the collection is rights-sensitive: no cloud inference, no API calls, no remote storage.
+### Data layout
 
-The architecture is a **mostly-decomposed specialist pipeline** with Gemma 4 as the visual and synthesis brain. Decomposition is preserved (rather than collapsing everything into a single multimodal call) because Whisper large-v3 still beats any generalist on 1970s broadcast audio, Apple Vision is rock-solid at chyron/signage OCR, and auditable seams matter for archival use — when a field is wrong you want to know *which* component was wrong. Cross-video reasoning is explicitly **not** in the MVP. See [`docs/local-llm-pipeline-mvp-2026-04-11.md`](docs/local-llm-pipeline-mvp-2026-04-11.md) for the full scoping doc — rationale, model trade-offs, prompts, effort estimate, and open decisions.
+```
+public/data/source/
+  videos/               # Drop source videos here
+  items.json            # Catalog source records
 
-### Stages
+data/runs/
+  video/<video_id>/
+    metadata.json       # Duration, source path
+    scenes.json         # Scene boundaries (may include merges)
+    scenes.raw.json     # Pristine PySceneDetect output (never modified)
+    merges.json         # Pending merge groups sidecar
+    transcript.json     # Whisper output (raw + cleaned)
+    audio.wav           # 16kHz mono PCM
+    keyframes/          # scene_NNN_{start,mid,end}.jpg
+  catalog/<run>/
+    classifications.json
+    edits.json          # Entity merge overlay
+```
 
-| # | Stage | Purpose | Tools |
-|---|-------|---------|-------|
-| 1 | **Ingest & Segment** | Extract audio track, detect scene boundaries, pick 1–3 keyframes per scene | `ffmpeg`, `ffprobe`, PySceneDetect (`ContentDetector`) |
-| 2 | **Per-modality extraction** | Run specialist models in parallel on audio + keyframes | mlx-whisper (large-v3-turbo) for transcripts; **Gemma 4 E4B** via MLX as primary VLM with **Qwen2.5-VL-7B** as A/B backend; Apple Vision for OCR; InsightFace (`buffalo_l`) for face embeddings |
-| 3 | **Cluster & aggregate** | Cluster face embeddings within a video, attach transcript segments to scenes by timestamp, build per-scene fact bundles (the "evidence packet" for Stage 4) | DBSCAN (cosine) on face embeddings, timestamp intersection |
-| 4 | **LLM synthesis** | Read per-scene fact bundles and emit Dublin-Core-compatible JSON via schema-constrained output | **Gemma 4 26B A4B** (MoE, Q4_K_M) via Ollama as primary; **Qwen2.5-14B-Instruct** (Q4_K_M) as 16 GB / tooling-instability fallback |
-| 5 | **Store & review** | Persist outputs non-destructively and expose for human-in-the-loop review, flagging low-confidence fields (locations, named people) for SME validation | SQLite index + per-video JSON sidecars, review UI reusing the classifier frontend shell |
+### Key design decisions
 
-#### Ambitious variant: collapsed Stage 2+4
-
-Because Gemma 4 26B A4B natively accepts video and audio, a second track worth prototyping *after* the decomposed path works is feeding Gemma 4 the raw video directly and asking it to emit the structured JSON in one call — collapsing Stages 2 and 4. Whisper still runs in parallel (better transcriber) and its output gets passed into Gemma 4's text context alongside the video. Head-to-head comparison against the decomposed path, not a replacement.
-
-### Stage 1 — Ingest & Segment (implemented)
-
-Real, working end-to-end. Drop a video into `public/data/source/videos/`, pick it from the dropdown, and click **Run Ingest**.
-
-**Backend** (`pipeline/video/ingest.py`)
-- `probe_duration()` — `ffprobe` to get clip length
-- `detect_scene_boundaries()` — PySceneDetect `ContentDetector` (default threshold 27.0)
-- `extract_keyframe()` — `ffmpeg` fast-seek single-frame JPEG extraction
-- `_keyframe_timestamps()` — start/mid/end (with 0.25s edge inset) for scenes ≥3s, midpoint only for shorter scenes
-- `extract_audio()` — `ffmpeg` 16 kHz mono PCM WAV extraction for downstream transcription
-- Writes `data/runs/video/<video_id>/scenes.json` + `scenes.raw.json` + `metadata.json` + `audio.wav` and `keyframes/scene_NNN_{start,mid,end}.jpg`
-- `scenes.raw.json` is the pristine PySceneDetect output, written at ingest time. `scenes.json` may later be modified by merge-apply; `.raw.json` never changes after creation.
-- `source_public_path` field is persisted so the frontend can serve the original video directly through Vite for clip preview
-
-**Scene merging** (`pipeline/video/ingest.py` merge subsystem)
-
-Users can consolidate adjacent scenes from the UI. The system uses a two-phase commit model with a `merges.json` sidecar:
-
-1. **Pending merges** — freely reversible per-group via `DELETE /merges/{group_id}`
-2. **Apply all merges** — bakes the merged view into `scenes.json`, clears the sidecar. Irreversible from the UI (re-run Stage 1 to reset). `scenes.raw.json` stays untouched as the pristine baseline.
-
-Key design points:
-- `merges.json` sidecar tracks groups, their member scene IDs, and status (`pending` | `committed`)
-- Merged scenes inherit the first constituent scene's ID (e.g., merging `_scene_007` + `_scene_008` + `_scene_009` → `_scene_007`), not a synthetic `_group_NNN` name
-- After apply, merged scenes are indistinguishable from raw scenes — `merged_from` and `merge_status` metadata is stripped
-- Group absorption: merging a pending group with adjacent scenes creates a larger group
-- Committed groups are frozen — cannot be absorbed or unmerged
-- Contiguity validation: only adjacent scenes in the raw scene list can be merged
-- v1→v2 migration: old sidecars without status fields default to "committed"
-- Segment reconciliation: when the merged-scenes view is assembled, the `segments` array is rewritten to reference the surviving merged scene IDs. Previously, merges that crossed segment boundaries could leave orphan scenes outside any segment — fixed by `_reconcile_segments()` which remaps each segment's `scene_ids` / `start` / `end` through the merge groups before returning the response.
-
-**Scene editing** (`pipeline/video/ingest.py`, `pipeline/video/router.py`)
-
-- **Inline rename**: Double-click a scene name in the UI to rename it. Updates `scenes.json` and `merges.json` references.
-- **Keyframe deletion**: Remove unwanted keyframes from scenes (useful after merging). Deletes both the JSON entry and the image file on disk. The last keyframe in a scene cannot be deleted.
-- **Time range editing**: Double-click a scene's time range in the scene list to edit start/end times inline. Changes persist immediately to `scenes.json`.
-- **Scene tagging**: Assign tags to scenes from a configurable valid-tags list (`pipeline/video/tags.json`). Tags appear as badges in the scene list and as a dropdown selector in the preview panel. Tags persist to `scenes.json`.
-- **Scene trimming**: Pause the video at any point inside a scene, then use "Trim to here" (keep beginning) or "Trim from here" (keep end). The adjacent scene automatically absorbs the trimmed portion to maintain continuity — no gaps between scenes.
-- **Scene splitting**: Pause the video inside a scene and click "Split here" to divide it at the current playback time. The first half keeps the original scene ID; the second half gets a `{id}_1` suffix. Keyframes are distributed to whichever half their timestamp falls into (and each half is guaranteed at least one keyframe — a fallback is extracted if needed). Both halves remain in the same segment. Persists immediately to `scenes.json`.
-
-**Segment detection** (`pipeline/video/segments.py`)
-
-Segments are narrative units made of scenes, detected via black-slug analysis. Black slugs — scenes whose keyframes are nearly all-black — serve as segment boundaries.
-
-- `detect_black_slugs()` — analyzes already-extracted keyframe JPEGs using a dual criterion: mean luminance < 30/255 AND standard deviation < 5.0 (to distinguish uniform black from dark-but-textured content like nighttime footage). Min duration 0.5s. No video re-scan needed. Handles "lifted black" tape encodings (e.g. JCU tapes with luminance 14–27).
-- `build_segments()` — detects slugs, tags scenes with `black_slug`, groups consecutive non-slug scenes into `content` segments and slug scenes into `boundary` segments. Auto-numbers content segments sequentially ("Segment 1", "Segment 2", ...) with a `segment_index` field (1, 2, 3, ...) and names boundary segments "Boundary".
-- `build_segments_from_tags()` — alternative detection method that uses existing `black_slug` tags as dividers instead of running luminance analysis. Useful when tags have been manually curated.
-- **Auto-merge adjacent black slugs** (optional, default on) — after tagging but before segment assembly, runs of 2+ consecutive `black_slug` scenes are collapsed into a single scene. Keeps only the earliest keyframe by timestamp and deletes every other keyframe file on disk; records the operation as a committed group in `merges.json` so the collapse is visible in the merge sidecar. Available via a checkbox in the Detect Segments modal for both detection methods.
-- `rename_segment()` — rename a segment's display name.
-- `update_segment_description()` — update a segment's description field. Persists to `scenes.json`.
-- `assign_item_to_segment()` — link a catalog item to a segment (1:1). Stores `item_id` on the segment object in `scenes.json`.
-- `clear_segments()` — removes segment grouping data from `scenes.json`. Scene tags (including `black_slug`) are preserved. Requires user confirmation via modal.
-- `create_segment()` — pulls a set of scenes (by ID) out of wherever they live (unsegmented, or in one or more existing content segments) and wraps them in a new segment. If scenes are extracted from the middle of a source segment, the remainder is split into multiple segments with `(1)` / `(2)` suffixes so every run of remaining scenes stays contiguous. All `segment_index` / `segment_id` values are reassigned sequentially after the operation.
-- `move_to_segment()` — same extraction logic as `create_segment`, but instead of making a new segment it inserts the pulled scenes into an existing target segment by timestamp order and auto-updates that target's `start` / `end`.
-- **Empty segment rendering**: the frontend scene list interleaves segment headers with scenes by start time so segments with zero `scene_ids` still show up as headers (useful during extraction / move flows where a source segment can momentarily end up empty before being collapsed).
-- On-demand, not automatic — user triggers detection from a modal offering two methods: scene analysis (luminance) or by existing slug tags.
-- Segments stored directly in `scenes.json` as a top-level `segments` array with `segment_id`, `segment_index`, `type` (`content`/`boundary`, configurable via `tags.json`), `name`, `description` (editable, auto-populated from VLM), `item_id` (optional catalog link), `scene_ids`, `start`, `end`, `vlm_analysis` (optional). Scene `tags` array is per-scene metadata.
-
-**Transcript editing** (`pipeline/video/router.py`)
-
-- **Inline transcript editor**: Toggle a "Transcript" panel in the scene/segment preview to view and edit transcript segments overlapping the current time range. Click segment text to edit inline, press Enter to save. Delete segments with ✕. Changes persist immediately to `transcript.json`.
-- **Subtitle overlay**: When `transcript.json` exists, subtitles display automatically on the video player during playback, synced to scene/segment time bounds. Subtitles update in real-time after transcript edits.
-- **Click-to-seek**: Click a transcript segment's timestamp to jump the video to that position.
-- **Timestamp editing**: Double-click a transcript segment's start or end timestamp to edit it inline. Accepts `mm:ss` or `mm:ss.d` format. Persists to `transcript.json`.
-
-**VLM segment analysis** (`pipeline/video/vlm.py`)
-
-On-demand visual understanding of segments via Ollama multimodal models. A modular module designed for reuse at scene or segment level.
-
-- `analyze_segment()` — collects keyframes (capped at 6, evenly sampled), transcript text overlapping the segment's time range, and metadata (name, type, duration, scene count). Sends as a multimodal prompt to Ollama and persists the result.
-- `_ollama_chat()` — wraps the Ollama `/api/chat` endpoint with base64 image support. Uses stdlib `urllib` (no extra dependencies).
-- Default model: **Gemma 4 E4B** via Ollama (multimodal, ~9 GB). Configurable per-request.
-- **Configurable system prompt**: Sets the VLM's role and context framing (default: 1970s–1980s Northeast Ohio broadcast archival). Editable in the VLM settings modal alongside the default user prompt. Both have "Save as default" (persists to `pipeline/video/settings.json`) and "Reset to default" buttons. The backend reads the system prompt from settings at analysis time — not passed per-request.
-- Default user prompt is an archival analysis template (visual content, people/locations, era, content type). Fully editable from the UI before each run, with a global default (persisted to `pipeline/video/settings.json`) and per-segment overrides.
-- **Catalog context injection**: When a segment has a linked catalog item, date, description, and additional notes from the item are appended to the VLM prompt automatically. This is controlled by an "Include catalog context" checkbox (checked by default) next to the Run VLM button. A "Preview full prompt" toggle shows the final concatenated prompt before sending.
-- **VLM-generated titles**: `_make_summary()` now makes a follow-up Ollama call to generate a concise 3-7 word title-case segment title (e.g., "Beach Day at Edgewater Park") instead of truncating the first sentence. Falls back to sentence truncation if Ollama fails.
-- **Auto-populates `description`**: When VLM analysis completes, the full analysis text is written to `segment.description`. This field is editable from the UI and persisted independently of the VLM analysis.
-- Results stored directly on the segment object in `scenes.json` as `vlm_analysis: { summary, full_analysis, model, prompt, analyzed_at }` plus `description` (editable copy).
-- Runs in a background thread (same pattern as ingest/transcribe) with status polling, since inference takes ~1 min per image on Apple Silicon.
-
-**Backend HTTP** (`pipeline/video/router.py`, mounted at `/api/video`)
-- `GET /source-videos` — list videos in `public/data/source/videos/`
-- `GET /videos` — list ingested runs
-- `POST /ingest` — kick off Stage 1 in a background thread, returns `video_id`
-- `GET /ingest/{video_id}/status` — poll phase / progress (`probing` → `detecting` → `extracting` → `completed`)
-- `GET /videos/{video_id}/scenes` — merged scene view (applies `merges.json` groups); pass `?raw=true` for untouched PySceneDetect output
-- `POST /videos/{video_id}/merges` — create a pending merge group from contiguous scene IDs
-- `DELETE /videos/{video_id}/merges/{group_id}` — unmerge a pending group (409 for committed)
-- `POST /videos/{video_id}/merges/apply` — bake all merges into `scenes.json` (irreversible)
-- `PATCH /videos/{video_id}/scenes/rename` — rename a scene (updates `scenes.json` + `merges.json`)
-- `POST /videos/{video_id}/scenes/delete-keyframe` — remove a keyframe from a scene (JSON entry + image file)
-- `PATCH /videos/{video_id}/scenes/time-range` — update a scene's start/end times
-- `PATCH /videos/{video_id}/scenes/tags` — set scene tags from valid tags list
-- `POST /videos/{video_id}/scenes/trim` — trim a scene at a timestamp, adjacent scene absorbs the trimmed portion
-- `POST /videos/{video_id}/scenes/split` — split a scene at a timestamp; first half keeps original ID, second half becomes `{id}_1`, keyframes distributed by timestamp
-- `POST /videos/{video_id}/segments/detect` — detect black slugs via luminance analysis and group scenes into segments
-- `POST /videos/{video_id}/segments/detect-from-tags` — detect segments using existing `black_slug` tags as dividers
-- `PATCH /videos/{video_id}/segments/{segment_id}/rename` — rename a segment
-- `PATCH /videos/{video_id}/segments/{segment_id}/description` — update a segment's description
-- `PATCH /videos/{video_id}/segments/{segment_id}/assign-item` — assign a catalog item_id to a segment (or `null` to unassign)
-- `DELETE /videos/{video_id}/segments` — clear all segment grouping data (preserves scene tags)
-- `POST /videos/{video_id}/segments/create` — create a new segment from a set of scene IDs, extracting them from existing segments if needed (splitting source segments into `(1)` / `(2)` remainders when pulled from the middle)
-- `POST /videos/{video_id}/segments/move` — move a set of scene IDs into an existing target segment; target's `start` / `end` auto-update and scenes are inserted in timestamp order
-- `POST /videos/{video_id}/segments/{segment_id}/analyze` — kick off VLM analysis in background thread, returns `{ status: "started" }`
-- `GET /videos/{video_id}/segments/{segment_id}/analyze/status` — poll VLM job status (`running` → `completed` / `failed`)
-- `GET /video-list` — merged list of all source videos cross-referenced with ingested runs (scene/transcript status, duration, and reviewer note per video)
-- `GET /videos/{video_id}/note` — read the reviewer note for a video
-- `PATCH /videos/{video_id}/note` — write or clear the reviewer note for a video (works for any `video_id`, whether or not it has been ingested)
-- `POST /ingest-pipeline` — combined scene detection + transcription in one background thread, with checkboxes to control which steps run
-- `GET /ingest-pipeline/{video_id}/status` — unified progress polling for the combined pipeline
-- `GET /tags` — list valid scene tags and segment types from `pipeline/video/tags.json` (shape: `{ tags: string[], segment_types: { value, label }[] }`, with backward-compat if the file is still a plain array)
-- `PATCH /videos/{video_id}/transcript/segments` — edit or delete transcript segments
-- `GET /videos/{video_id}/keyframes/{filename}` — path-traversal-protected JPEG serving
-
-**Settings API** (mounted at `/api`, in `pipeline/server.py`)
-- `GET /settings` — read persistent user settings from `data/settings.json`
-- `PATCH /settings` — update settings (merge-patch semantics). Currently stores `vlm_default_prompt`.
-
-**Frontend** (`src/views/VideoPipeline/Ingest/index.tsx`)
-
-Two-level master-detail navigation:
-
-- **Level 1 — Unified video list**: Single table showing all source videos cross-referenced with ingested runs. Columns: filename, **inline-editable Note** (saves on blur / Enter to `data/runs/video/_notes.json`, keyed by video_id so notes persist even for un-ingested videos), duration (from `metadata.json`, formatted `H:MM:SS`; file size surfaced as a cell tooltip), scene count, transcript segment count, and an action button (View if fully ingested, Ingest with checkboxes for scene detection/transcription, or Transcribe if only scenes exist). Inline progress bar during ingest showing phase labels (probing → detecting → extracting → transcribing → completed).
-- **Level 2 — Scene browser**: Three-column layout with back navigation.
-  - **Catalog column (20%, toggleable)**: Lists catalog items from `items.json` matching the current video by filename. Each item shows ID, segment assignment badge, description, duration, and classification thread badges. Filter toggle (All/Assigned/Unassigned) for tracking catalog-to-segment linking progress.
-  - **Center column (38–55%)**: Compact scene list with thumbnail, checkbox for merge selection, scene ID (double-click to rename), merge status badge, time range (double-click to edit), duration, `black_slug` tag badge, and ✕ unmerge button. Pinned header shows "SCENES · N" (or filtered count / total when a filter is active), an expand-all and collapse-all icon pair (double-chevron icons; hidden when no segments exist, dimmed when no-op), and a filter icon button with a maize dot badge when any filter is active; clicking the filter icon opens a dropdown containing the duration filter (min/max seconds) and segment type pill group (dynamic from `tags.json` `segment_types`, with counts) plus a "Clear filters" action. Segment headers as collapsible dividers with name (double-click to rename), ID suffix, type badge, catalog item assignment button, scene count, and time range — tagged with a `data-segment-id` attribute for programmatic scroll-to. Empty segments (zero scenes) still render as headers so move/extract flows stay visible. Merge action bar at bottom includes "Move N to segment…" action that opens a modal listing all existing segments (sorted by index, with badge + count) plus an inline-expanding "+ Create new segment" option (name + type inputs) — moving into an existing segment inserts by timestamp, creating a new segment drops it into the correct index slot. Toggleable **transcript view** replaces the scene list with full scrollable transcript (cleaned/raw toggle, re-clean, click-to-seek, inline editing of text and timestamps in cleaned mode; raw mode is read-only with a notice), with Scene/Full Video mode switch. Re-clean prompts a confirmation modal when the session has unsaved transcript edits so edits aren't silently discarded.
-  - **Right panel (42–45%)**: Scene-scoped video player with subtitle overlay (from `transcript.json`), custom controls (seek bar, play/pause, time display), scene metadata, editable tags (dropdown from `tags.json`), segment info, trim + split buttons (appear when paused mid-scene), toggleable transcript editor with click-to-seek timestamps, and 3-column keyframe grid with hover ✕ buttons. Segment preview mode shows the full segment range with all member keyframes and contiguity check. In Full Video transcript mode, shows unclamped video player with live transcript captions overlaid.
-  - Single-click a row → preview; checkbox click → multi-select for merge; shift-click → range select (file-browser semantics)
-  - Click segment header → collapse/expand + segment preview; segment-level actions (Detect Segments, Clear Segments, Clean Up) are grouped behind a single **Actions** dropdown in the page toolbar — the menu swaps Detect ↔ Clear based on whether segments already exist, and Clean Up (stub modal describing the planned `scenes.json` validate / orphan-drop behavior) is disabled until segments exist. "Detect Segments" opens a modal with two methods (luminance analysis or by existing slug tags) plus an "Auto-merge adjacent black slugs" checkbox (default on) that collapses consecutive slug scenes and trims keyframes to the earliest one in the run; "Clear Segments" requires confirmation modal warning about data loss; ✦ VLM analyze button on content segments opens inline prompt editor; catalog item assign button on content segments opens dropdown picker. Segment headers display "S{index}" prefix (e.g. "S1 Segment 1").
-  - **VLM Analysis panel**: Toggle in segment detail view. Shows full analysis text, model/timestamp metadata, prompt used (collapsible), and re-analyze button. Purple dot indicator on segment bar when analysis exists. "Include catalog context" checkbox controls whether linked catalog item metadata is appended to the prompt. "Preview full prompt" toggle shows the final prompt including any catalog context. VLM prompt settings gear icon opens a modal to edit the global default prompt, with "Save as Default" (persists to disk) and "Apply to All" (also resets per-segment overrides).
-  - **Catalog item assignment**: 1:1 link between content segments and catalog items. Assign via dropdown on segment header; assigned item shows as maize badge. Catalog column shows reverse reference (segment name on assigned items). Already-assigned items greyed out in picker. Clicking an assigned catalog row expands its target segment, selects it as the preview, and scrolls the segment header into view — implemented via the `data-segment-id` attribute on segment headers and a deferred `scrollIntoView` that waits for React to commit the expand-state update before measuring.
-  - Merge status badges: maize `PENDING ×N` vs teal `MERGED ×N`
-  - "Apply All Merges" button appears when pending merges exist
-
-### Stages 2–5 (planned)
-
-Sidebar entries and route stubs exist for **Extract**, **Cluster**, **Synthesize**, and **Review** under `src/views/VideoPipeline/`. Each currently renders a "not built yet" placeholder. Backend modules will be added under `pipeline/video/` as siblings to `ingest.py` and mounted on the same router:
-
-- `extract.py` — Stage 2 orchestrator that dispatches a scene's audio + keyframes to the specialist backends (mlx-whisper, the VLM backend, Apple Vision OCR, InsightFace) behind a common interface. The VLM backend is deliberately swappable so Gemma 4 E4B and Qwen2.5-VL-7B can be A/B tested on the same clips for caption quality, OCR pickup, temporal coherence, and throughput.
-- `aggregate.py` — Stage 3 face DBSCAN + transcript-to-scene time alignment + per-scene fact-bundle assembly.
-- `synthesize.py` — Stage 4 Ollama client (Gemma 4 26B A4B primary, Qwen2.5-14B fallback) with JSON-schema-constrained output. Emits the Dublin-Core-compatible metadata document.
-- `store.py` — Stage 5 SQLite index + JSON sidecar writer. Sidecars stay next to the source video, non-destructively, per Ben's "indexes not transforms" philosophy.
-
-Human-in-the-loop is an explicit design seam: Stage 4 output flags low-confidence fields (especially named people and Cleveland landmarks) for SME review before anything becomes public. Known weak points vs. the Gemini prototype are named-entity recognition on historic Cleveland figures and landmark geolocation — mitigated by building a gazetteer of NEOBA-relevant names/places from the April 7 text-classifier entity run and injecting it as context into the VLM and synthesis prompts.
-
-### Current dev status
-
-| Area | Status |
-|---|---|
-| Sidebar restructure (collapsible with Lucide icons, Catalog Classifier + Video Pipeline + Utility groups) | Done |
-| Backend sub-package layout (`pipeline/video/`) wired into existing FastAPI app | Done |
-| Stage 1 ingest — ffprobe / PySceneDetect / ffmpeg / audio extraction | Done |
-| Stage 1 ingest — `scenes.raw.json` pristine baseline written at ingest time | Done |
-| Stage 1 scene merging — two-phase merge model (pending → committed), `merges.json` sidecar, group absorption, contiguity validation, apply-all bakes into `scenes.json`, merged scenes named after first constituent | Done |
-| Stage 1 scene editing — inline rename, keyframe deletion, time range editing, scene tagging, scene trimming with adjacent-scene absorption, scene splitting at playback time (keyframes distributed by timestamp) | Done |
-| Stage 1 segment detection — black-slug-based segment grouping (dual criterion: luminance + std deviation), detection modal (by scene analysis or by existing tags), segment index numbering, segment rename, catalog item assignment (1:1 link), clear segments with confirmation modal, segment type filter with counts, empty-segment header rendering, merge-segment reconciliation so cross-segment merges no longer orphan scenes | Done |
-| Stage 1 segment editing — "Move N to segment" action with existing-segment list or inline create-new, extraction from source segments (with contiguous-remainder splitting into `(1)` / `(2)`), sequential `segment_index` / `segment_id` reassignment | Done |
-| Stage 1 config — `pipeline/video/tags.json` carries both scene tags and `segment_types` (content / boundary) in a single `{ tags, segment_types }` shape, consumed by the frontend filter and the create/move segment modal | Done |
-| Stage 1 transcript integration — subtitle overlay on video player, toggleable inline transcript editor with edit/delete, click-to-seek timestamps | Done |
-| Stage 1 catalog cross-reference — toggleable catalog column showing items matching video by filename, segment assignment badges, assigned/unassigned filter, click-to-jump from assigned catalog row to its segment (expand + scroll into view) | Done |
-| Stage 1 video list — inline Note column (persisted to `data/runs/video/_notes.json`), Duration column replacing file-size (pulled from `metadata.json`, H:MM:SS format, size still available as tooltip) | Done |
-| Stage 1 Actions menu — Detect Segments / Clear Segments / Clean Up grouped under a single dropdown with context-sensitive enabling (Clean Up is stub-only), plus Auto-merge adjacent black slugs option in the Detect Segments modal | Done |
-| Stage 1 scene-list header controls — expand-all / collapse-all icons, filter dropdown behind filter icon (duration range + segment-type pills + clear filters), pinned header with filtered-count display | Done |
-| Stage 1 transcript view — full transcript in scene browser (cleaned/raw toggle, re-clean, click-to-seek), inline editing of text and timestamps in cleaned mode (raw stays read-only), re-clean confirmation modal when session edits exist, Scene/Full Video mode with live subtitle overlay on unclamped video player | Done |
-| Stage 1 frontend — three-column master-detail UI (catalog + scene list + preview, with transcript view toggle; merge selection, shift-click range select, scene-scoped video player with subtitles, segment headers, keyframe grid, duration + segment filters, inline rename, tag assignment, trim buttons) | Done |
-| Stage 2 Extract — mlx-whisper transcripts (`whisper-large-v3-turbo`, segment-level timestamps, background job + polling, click-to-seek transcript viewer) | Done |
-| Stage 2 Extract — transcript cleanup pass (hallucination-phrase drop, adjacent-duplicate dedup, intra-segment word-run collapse; raw + cleaned both persisted; raw/cleaned toggle and `/transcribe/{id}/reclean` endpoint for re-running rules without re-invoking Whisper) | Done |
-| VLM segment analysis — on-demand Gemma 4 E4B via Ollama, multimodal (keyframes + transcript + metadata), editable prompt with global default (persisted to `data/settings.json`) and per-segment overrides, optional catalog context injection with preview, async background job with polling, results in segment bar + detail panel | Done |
-| Unified ingest pipeline — combined scene detection + transcription in one job with phase progress, unified video list with status indicators | Done |
-| Persistent settings — `data/settings.json` via `GET/PATCH /api/settings`, currently stores VLM default prompt | Done |
-| Stage 2 Extract — VLM backend interface (Gemma 4 E4B primary, Qwen2.5-VL-7B A/B) | Stub view, not implemented |
-| Stage 2 Extract — Apple Vision OCR on keyframes | Stub view, not implemented |
-| Stage 2 Extract — InsightFace face detection + embeddings | Stub view, not implemented |
-| Stage 3 Aggregate — face DBSCAN + transcript/scene time alignment + fact bundles | Stub view, not implemented |
-| Stage 4 Synthesize — Gemma 4 26B A4B via Ollama, schema-constrained JSON | Stub view, not implemented |
-| Stage 5 Store & Review — SQLite index + JSON sidecars + review UI | Stub view, not implemented |
-| Collapsed Stage 2+4 variant (Gemma 4 native-video path) | Not started (prototype after decomposed path works) |
-| Model Compare sibling view | Stub, not implemented |
+- **All-local inference.** The NEOBA collection is rights-sensitive. No video data leaves CPL hardware — all models run on-device via Ollama, MLX, and Apple frameworks.
+- **Decomposed specialists over monolithic multimodal.** Whisper beats generalist models on 1970s broadcast audio. Apple Vision is better at chyron OCR. Auditable seams matter for archival work — when a field is wrong, you can trace which component produced it.
+- **Non-destructive sidecars.** Pipeline outputs sit alongside source files as JSON. The raw PySceneDetect output (`scenes.raw.json`) is never modified after creation. Merges are tracked in a reversible sidecar until explicitly baked.
+- **Human-in-the-loop.** Stage 4 output flags low-confidence fields (named people, Cleveland landmarks) for subject-matter-expert review before anything becomes public.
 
 ## Setup
+
+### Prerequisites
+
+- Node.js 18+
+- Python 3.11+
+- ffmpeg and ffprobe on PATH
+- [Ollama](https://ollama.com/) (for VLM analysis)
 
 ### Frontend
 
 ```bash
 npm install
-npm run dev        # starts on http://localhost:5173
+npm run dev          # http://localhost:5173
 ```
 
 ### Backend
@@ -244,41 +98,43 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r pipeline/requirements.txt
 
-# Set your Anthropic API key
+# Required for catalog classification (not needed for video pipeline)
 echo "ANTHROPIC_API_KEY=sk-..." > .env
 
 .venv/bin/python3 -m uvicorn pipeline.server:app --host 0.0.0.0 --port 8000
 ```
 
-The video pipeline (Stage 1) also requires `ffmpeg` and `ffprobe` on `PATH`:
+### Ollama (for VLM analysis)
 
 ```bash
-brew install ffmpeg          # macOS
-# or: sudo apt install ffmpeg
+brew install ollama
+ollama pull gemma4:e4b       # ~9 GB, multimodal
+ollama serve                 # http://localhost:11434
 ```
 
-VLM segment analysis requires [Ollama](https://ollama.com/) with a vision-capable model:
+The Vite dev server proxies all `/api` requests to the FastAPI backend automatically.
 
-```bash
-brew install ollama          # macOS
-ollama pull gemma4:e4b       # ~9 GB, multimodal (text + image)
-ollama serve                 # starts on http://localhost:11434
-```
+## API overview
 
-The Vite dev server proxies `/api` requests to the backend.
+All video pipeline endpoints are mounted at `/api/video`. Key groups:
 
-### Entity Merging
+| Group | Examples |
+|-------|---------|
+| **Ingest** | `POST /ingest`, `GET /ingest/{id}/status`, `POST /ingest-pipeline` |
+| **Scenes** | `GET /videos/{id}/scenes`, `POST /merges`, `POST /scenes/split`, `POST /scenes/trim` |
+| **Segments** | `POST /segments/detect`, `POST /segments/create`, `POST /segments/move`, `PATCH /segments/{id}/description` |
+| **Transcripts** | `PATCH /videos/{id}/transcript/segments` |
+| **VLM** | `POST /segments/{id}/analyze`, `GET /segments/{id}/analyze/status` |
+| **Settings** | `GET /api/settings`, `PATCH /api/settings` |
 
-The LLM extracts entities per-item independently, so the same entity often appears with different surface forms (e.g., "RTA" vs "Regional Transit Authority"). The Entity Browser supports:
+See [router.py](pipeline/video/router.py) for the full endpoint list.
 
-- **Multi-merge**: Select 2+ entities, set a canonical name, and merge. All `item_ids` combine under the canonical entry.
-- **Suggested merges**: Auto-detected candidates via substring, abbreviation, prefix, and normalization matching. One-click accept or dismiss.
-- **Single-name resolution**: A queue of people entities with single names (e.g., "Nader") that can be resolved to full names (e.g., "Ralph Nader").
+## Limitations
 
-Merges are stored as overlay edits in `data/runs/catalog/<run>/edits.json` and never modify the original LLM output (`classifications.json`). They are applied when rebuilding the entity index and during export.
-
-## Data
-
-Source items are in `public/data/source/items.json`. Classification outputs are saved to `data/runs/catalog/<run-name>/`.
-
-Note: The source file contains 14,242 rows but 161 are duplicates (same container-item ID), yielding 14,081 unique items.
+- **Stages 3-5 are not yet implemented.** Face clustering, LLM synthesis, and the review/store layer exist only as frontend stubs and planned module outlines.
+- **Single-video scope.** Cross-video reasoning (e.g., recognizing the same person across tapes) is explicitly out of scope for the MVP.
+- **Apple Silicon assumed.** mlx-whisper and MLX-based model loading target Apple Silicon Macs. The pipeline has not been tested on Linux or Intel hardware.
+- **No authentication.** The FastAPI server has no auth layer — it is designed to run on a local workstation or trusted LAN, not exposed to the public internet.
+- **Named entity recognition is weak.** Historic Cleveland figures and local landmarks are frequently missed or hallucinated by current models. Mitigation is planned via a NEOBA-specific gazetteer injected into VLM/synthesis prompts.
+- **Transcript quality varies.** 1970s broadcast audio with background noise, overlapping speech, or degraded tape produces noisy Whisper output. The cleanup pass catches common hallucination patterns but manual review is still needed.
+- **No batch/queue processing.** Videos are processed one at a time through the UI. There is no job queue for bulk ingest of an entire tape collection.
